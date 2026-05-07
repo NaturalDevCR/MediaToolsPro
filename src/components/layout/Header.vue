@@ -26,7 +26,7 @@ const tabs = [
     <!-- Branding -->
     <div class="flex items-center gap-3 w-[200px]">
       <div class="w-8 h-8 rounded-xl bg-gradient-to-br from-cyan-400 to-sky-600 shadow-lg shadow-cyan-500/20"></div>
-      <span class="font-bold text-lg tracking-tight text-gray-800 dark:text-gray-100">AudioToolsPro</span>
+      <span class="font-bold text-lg tracking-tight text-gray-800 dark:text-gray-100">MediaToolsPro</span>
     </div>
 
     <!-- Navigation Tabs -->

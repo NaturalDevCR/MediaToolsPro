@@ -53,8 +53,10 @@ type OverlayPanel =
 
 const DOWNLOAD_CONCURRENT_LIMIT = 2;
 const PROCESS_CONCURRENT_LIMIT = 2;
-const QUEUE_STORAGE_KEY = 'audiotoolspro.queue.v1';
-const SETTINGS_STORAGE_KEY = 'audiotoolspro.settings.v1';
+const QUEUE_STORAGE_KEY = 'mediatoolspro.queue.v1';
+const SETTINGS_STORAGE_KEY = 'mediatoolspro.settings.v1';
+const LEGACY_QUEUE_STORAGE_KEY = 'audiotoolspro.queue.v1';
+const LEGACY_SETTINGS_STORAGE_KEY = 'audiotoolspro.settings.v1';
 const AUDIO_FORMATS = ['mp3', 'flac', 'ogg', 'wav', 'm4a', 'aac'];
 const VIDEO_FORMATS = ['mp4', 'webm', 'mkv'];
 const AUDIO_BITRATES = ['320', '256', '192', '128'];
@@ -233,7 +235,7 @@ const savedCookiesActionLabel = computed(() =>
 );
 const savedCookiesHelpText = computed(() =>
   cookiesFile.value.trim()
-    ? 'AudioToolsPro will use the saved internal copy even if the original export gets moved or deleted.'
+    ? 'MediaToolsPro will use the saved internal copy even if the original export gets moved or deleted.'
     : 'Import a cookies.txt export only when a source needs an authenticated session.',
 );
 const downloadVideoTargetSummary = computed(() => {
@@ -552,6 +554,10 @@ function settingsKeyForMode(mode: StudioMode) {
   return `${SETTINGS_STORAGE_KEY}.${mode}`;
 }
 
+function legacySettingsKeyForMode(mode: StudioMode) {
+  return `${LEGACY_SETTINGS_STORAGE_KEY}.${mode}`;
+}
+
 function collectSettings(): PersistedStudioSettings {
   return {
     format: format.value,
@@ -679,7 +685,9 @@ function applySettings(settings: Record<string, unknown>, mode: StudioMode) {
 
 function restoreSettings(mode: StudioMode = studioMode.value) {
   try {
-    const raw = window.localStorage.getItem(settingsKeyForMode(mode));
+    const raw =
+      window.localStorage.getItem(settingsKeyForMode(mode)) ??
+      window.localStorage.getItem(legacySettingsKeyForMode(mode));
     if (!raw) {
       applySettings(defaultSettingsForMode(mode), mode);
       return;
@@ -694,7 +702,9 @@ function restoreSettings(mode: StudioMode = studioMode.value) {
 
 function restoreActiveStudioMode() {
   try {
-    const raw = window.localStorage.getItem(SETTINGS_STORAGE_KEY);
+    const raw =
+      window.localStorage.getItem(SETTINGS_STORAGE_KEY) ??
+      window.localStorage.getItem(LEGACY_SETTINGS_STORAGE_KEY);
     if (!raw) {
       return;
     }
@@ -862,7 +872,7 @@ function restoreQueueItem(value: unknown): QueueItemData | null {
     item.status === 'waiting'
       ? 'Pending in a previous session and not started.'
       : isActiveStatus(String(item.status) as QueueStatus)
-        ? 'Interrupted when AudioToolsPro was reloaded.'
+        ? 'Interrupted when MediaToolsPro was reloaded.'
         : typeof item.detail === 'string'
           ? item.detail
           : undefined;
@@ -909,7 +919,9 @@ function restoreQueueItem(value: unknown): QueueItemData | null {
 
 function restoreQueueHistory() {
   try {
-    const raw = window.localStorage.getItem(QUEUE_STORAGE_KEY);
+    const raw =
+      window.localStorage.getItem(QUEUE_STORAGE_KEY) ??
+      window.localStorage.getItem(LEGACY_QUEUE_STORAGE_KEY);
     if (!raw) {
       return;
     }
@@ -929,6 +941,7 @@ function restoreQueueHistory() {
 
     const unfinishedCount = restored.filter((item) =>
       item.detail === 'Pending in a previous session and not started.' ||
+      item.detail === 'Interrupted when MediaToolsPro was reloaded.' ||
       item.detail === 'Interrupted when AudioToolsPro was reloaded.',
     ).length;
 
@@ -2765,7 +2778,7 @@ onUnmounted(() => {
             >
               <p class="text-xs uppercase tracking-[0.22em] text-slate-400">Source chapter split</p>
               <p class="text-sm text-slate-300 leading-6">
-                AudioToolsPro will read embedded chapter marks from the selected file and cut at those timestamps.
+                MediaToolsPro will read embedded chapter marks from the selected file and cut at those timestamps.
                 If the source has no valid chapters, the same silence settings below are used as a fallback.
               </p>
               <div class="grid grid-cols-1 md:grid-cols-3 gap-4 pt-2">
@@ -3443,7 +3456,7 @@ onUnmounted(() => {
 
                   <div class="rounded-[22px] border border-cyan-400/15 bg-cyan-400/[0.04] p-4">
                     <p class="text-sm text-slate-300 leading-6">
-                      The original exported file can change or disappear after import. AudioToolsPro keeps its own internal copy and warns you when that saved session looks outdated.
+                      The original exported file can change or disappear after import. MediaToolsPro keeps its own internal copy and warns you when that saved session looks outdated.
                     </p>
                   </div>
                 </section>

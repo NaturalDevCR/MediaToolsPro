@@ -11,27 +11,35 @@ permissions:
 
 jobs:
   release:
-    name: Build ${{ matrix.platform }}
+    name: Build ${{ matrix.name }}
     runs-on: ${{ matrix.platform }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - platform: ubuntu-22.04
+          - name: Linux x64
+            platform: ubuntu-22.04
             args: ""
-          - platform: windows-latest
+            rust_targets: ""
+          - name: Windows x64
+            platform: windows-latest
             args: ""
-          - platform: macos-latest
+            rust_targets: ""
+          - name: macOS Intel
+            platform: macos-15-intel
             args: "--target x86_64-apple-darwin"
-          - platform: macos-latest
+            rust_targets: "x86_64-apple-darwin"
+          - name: macOS Apple Silicon
+            platform: macos-15
             args: "--target aarch64-apple-darwin"
+            rust_targets: "aarch64-apple-darwin"
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Install Linux dependencies
-        if: matrix.platform == 'ubuntu-22.04'
+        if: startsWith(matrix.platform, 'ubuntu-')
         run: |
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
@@ -48,7 +56,7 @@ jobs:
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+          targets: ${{ matrix.rust_targets }}
 
       - name: Cache Rust
         uses: swatinem/rust-cache@v2
@@ -64,7 +72,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tagName: "app-v__VERSION__"
-          releaseName: "AudioToolsPro v__VERSION__"
+          releaseName: "MediaToolsPro v__VERSION__"
           releaseBody: "See the assets below to download this release."
           releaseDraft: true
           prerelease: false
