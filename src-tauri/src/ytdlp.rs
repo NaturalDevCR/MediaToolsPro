@@ -100,22 +100,11 @@ pub fn clear_saved_cookies_file<R: Runtime>(app: AppHandle<R>) -> Result<(), Str
     Ok(())
 }
 
-#[tauri::command]
-pub async fn list_formats<R: Runtime>(
-    app: AppHandle<R>,
-    request: ListFormatsRequest,
+fn run_ytdlp_list_formats(
+    ytdlp_path: &PathBuf,
+    url: &str,
+    cookies_file: Option<&str>,
 ) -> Result<YtdlpFormatsResponse, String> {
-    let bin_dir = app.path().app_data_dir().unwrap().join("bin");
-    let ytdlp_path = bin_dir.join(if cfg!(windows) {
-        "yt-dlp.exe"
-    } else {
-        "yt-dlp"
-    });
-
-    if !ytdlp_path.exists() {
-        return Err("yt-dlp binary is missing. Install it from Settings first.".into());
-    }
-
     let mut args = vec![
         "--dump-single-json".to_string(),
         "--no-download".to_string(),
@@ -123,39 +112,23 @@ pub async fn list_formats<R: Runtime>(
         "--no-playlist".to_string(),
     ];
 
-    let cookies_path = request
-        .cookies_file
-        .as_ref()
-        .and_then(|v| {
-            let trimmed = v.trim();
-            if trimmed.is_empty() {
-                None
-            } else {
-                Some(trimmed.to_string())
-            }
-        });
-    let has_cookies = cookies_path
-        .as_ref()
-        .map(|p| Path::new(p).is_file())
+    let has_cookies = cookies_file
+        .map(|p| Path::new(p.trim()).is_file())
         .unwrap_or(false);
 
-    if is_youtube_url(&request.url) && !has_cookies {
-        // Fallback extractor for public videos when no cookies are available
-        // to avoid PO-Token gated 403 failures.
+    if is_youtube_url(url) && !has_cookies {
         args.push("--extractor-args".to_string());
         args.push("youtube:player_client=android_vr".to_string());
     }
 
     if has_cookies {
-        if let Some(path) = cookies_path {
-            args.push("--cookies".to_string());
-            args.push(path);
-        }
+        args.push("--cookies".to_string());
+        args.push(cookies_file.unwrap().trim().to_string());
     }
 
-    args.push(request.url.clone());
+    args.push(url.to_string());
 
-    let output = std::process::Command::new(&ytdlp_path)
+    let output = std::process::Command::new(ytdlp_path)
         .args(&args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -175,7 +148,7 @@ pub async fn list_formats<R: Runtime>(
     let json: serde_json::Value =
         serde_json::from_slice(&output.stdout).map_err(|e| format!("Failed to parse yt-dlp output: {}", e))?;
 
-    let title = json["title"].as_str().unwrap_or(&request.url).to_string();
+    let title = json["title"].as_str().unwrap_or(url).to_string();
     let duration = json["duration"].as_f64();
     let thumbnail = json["thumbnail"].as_str().map(|s| s.to_string());
 
@@ -209,7 +182,6 @@ pub async fn list_formats<R: Runtime>(
         }
     }
 
-    // Also include format entries from info dict if formats array is empty
     if formats.is_empty() {
         if let Some(fmt) = json["format_id"].as_str() {
             let vcodec = json["vcodec"].as_str().unwrap_or("none");
@@ -241,6 +213,53 @@ pub async fn list_formats<R: Runtime>(
 }
 
 #[tauri::command]
+pub async fn list_formats<R: Runtime>(
+    app: AppHandle<R>,
+    request: ListFormatsRequest,
+) -> Result<YtdlpFormatsResponse, String> {
+    let bin_dir = app.path().app_data_dir().unwrap().join("bin");
+    let ytdlp_path = bin_dir.join(if cfg!(windows) {
+        "yt-dlp.exe"
+    } else {
+        "yt-dlp"
+    });
+
+    if !ytdlp_path.exists() {
+        return Err("yt-dlp binary is missing. Install it from Settings first.".into());
+    }
+
+    let cookies_path = request
+        .cookies_file
+        .as_ref()
+        .and_then(|v| {
+            let trimmed = v.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        });
+
+    // Try with cookies first if available
+    if let Some(ref path) = cookies_path {
+        match run_ytdlp_list_formats(&ytdlp_path, &request.url, Some(path)) {
+            Ok(response) => return Ok(response),
+            Err(err) => {
+                // If it looks like a cookie/public video issue, retry without cookies
+                if looks_like_public_video_failure(&err) {
+                    emit_log(&app, "Format listing failed with cookies, retrying without cookies...", "warn");
+                    return run_ytdlp_list_formats(&ytdlp_path, &request.url, None);
+                }
+                return Err(err);
+            }
+        }
+    }
+
+    // No cookies, use public fallback
+    run_ytdlp_list_formats(&ytdlp_path, &request.url, None)
+}
+
+#[tauri::command]
 pub async fn start_download<R: Runtime>(
     app: AppHandle<R>,
     state: State<'_, JobState>,
@@ -256,15 +275,64 @@ pub async fn start_download<R: Runtime>(
     emit_log(&app_handle, format!("Queued download for {}", url), "info");
 
     tokio::spawn(async move {
+        let mut current_request = request.clone();
+
         let result = run_download_process(
             app_handle.clone(),
-            request.clone(),
+            current_request.clone(),
             Arc::clone(&pid),
             Arc::clone(&cancelled),
         )
         .await;
 
-        if let Err(error) = result {
+        let final_result = if let Err(ref error) = result {
+            if request.cookies_file.is_some()
+                && !cancelled.load(Ordering::SeqCst)
+                && looks_like_public_video_failure(error)
+            {
+                emit_log(
+                    &app_handle,
+                    format!(
+                        "Download failed with cookies ({}), retrying without cookies...",
+                        error
+                    ),
+                    "warn",
+                );
+                current_request.cookies_file = None;
+
+                emit_job_progress(
+                    &app_handle,
+                    JobProgressPayload {
+                        id: id.clone(),
+                        job_kind: "download".into(),
+                        media_kind: media_kind.clone(),
+                        status: "downloading".into(),
+                        percent: 0.0,
+                        speed: "-".into(),
+                        eta: "-".into(),
+                        total_size: "-".into(),
+                        title: Some(url.clone()),
+                        detail: Some("Retrying without cookies...".into()),
+                        output_path: None,
+                        error: None,
+                    },
+                );
+
+                run_download_process(
+                    app_handle.clone(),
+                    current_request,
+                    Arc::clone(&pid),
+                    Arc::clone(&cancelled),
+                )
+                .await
+            } else {
+                result
+            }
+        } else {
+            result
+        };
+
+        if let Err(error) = final_result {
             if cancelled.load(Ordering::SeqCst) {
                 emit_job_progress(
                     &app_handle,
@@ -339,26 +407,12 @@ async fn run_download_process<R: Runtime>(
         return Err("Cancelled before download started".into());
     }
 
-    let azuracast_target = is_azuracast_target(request.audio_target.as_deref());
-    let google_tv_cast_target = is_google_tv_cast_target(request.video_target.as_deref());
     let is_audio_request = matches!(
         request.format.as_str(),
         "mp3" | "wav" | "flac" | "m4a" | "aac" | "ogg" | "opus"
     );
-    let effective_format = if azuracast_target && is_audio_request {
-        "mp3".to_string()
-    } else if google_tv_cast_target && !is_audio_request {
-        "mp4".to_string()
-    } else {
-        request.format.clone()
-    };
-    let effective_quality = if azuracast_target && is_audio_request {
-        "320".to_string()
-    } else if google_tv_cast_target && !is_audio_request {
-        "2160".to_string()
-    } else {
-        request.quality.clone()
-    };
+    let effective_format = request.format.clone();
+    let effective_quality = request.quality.clone();
 
     let bin_dir = app.path().app_data_dir().unwrap().join("bin");
     let ytdlp_path = bin_dir.join(if cfg!(windows) {
@@ -428,21 +482,11 @@ async fn run_download_process<R: Runtime>(
                 args.push("--audio-quality".to_string());
                 args.push("0".to_string());
             }
-
-            if azuracast_target {
-                args.push("--postprocessor-args".to_string());
-                args.push(
-                    "ExtractAudio+ffmpeg_o:-ar 44100 -ac 2 -id3v2_version 3 -write_id3v1 1".to_string(),
-                );
-            }
         } else {
             args.push("--recode-video".to_string());
             args.push(effective_format.clone());
         }
-    } else if matches!(
-        effective_format.as_str(),
-        "mp3" | "wav" | "flac" | "m4a" | "aac" | "ogg" | "opus"
-    ) {
+    } else if is_audio_request {
         args.push("-x".to_string());
         args.push("--audio-format".to_string());
         args.push(audio_format_for_ytdlp(&effective_format).to_string());
@@ -454,29 +498,11 @@ async fn run_download_process<R: Runtime>(
             args.push("--audio-quality".to_string());
             args.push("0".to_string());
         }
-
-        if azuracast_target {
-            args.push("--postprocessor-args".to_string());
-            args.push(
-                "ExtractAudio+ffmpeg_o:-ar 44100 -ac 2 -id3v2_version 3 -write_id3v1 1".to_string(),
-            );
-        }
     } else {
         args.push("--recode-video".to_string());
         args.push(effective_format.clone());
 
-        if google_tv_cast_target {
-            args.push("-f".to_string());
-            args.push(
-                "bestvideo[height<=2160][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=2160]+bestaudio/best[height<=2160]/best"
-                    .to_string(),
-            );
-            args.push("--postprocessor-args".to_string());
-            args.push(
-                "VideoConvertor+ffmpeg_o:-vf scale=3840:2160:force_original_aspect_ratio=decrease,pad=3840:2160:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=24,format=yuv420p -c:v libx264 -preset fast -crf 23 -profile:v high -level 5.1 -c:a aac -b:a 192k -ac 2 -ar 48000 -movflags +faststart"
-                    .to_string(),
-            );
-        } else if effective_quality != "best" {
+        if effective_quality != "best" {
             args.push("-f".to_string());
             args.push(format!(
                 "bestvideo[height<={}]+bestaudio/best[height<={}]/best",
@@ -727,14 +753,6 @@ fn file_label(path: &str) -> String {
         .to_string()
 }
 
-fn is_azuracast_target(target: Option<&str>) -> bool {
-    matches!(target, Some("azuracast"))
-}
-
-fn is_google_tv_cast_target(target: Option<&str>) -> bool {
-    matches!(target, Some("google_tv_cast"))
-}
-
 fn is_youtube_url(url: &str) -> bool {
     url.contains("youtube.com/") || url.contains("youtu.be/")
 }
@@ -784,5 +802,22 @@ fn looks_like_cookie_auth_issue(message: &str) -> bool {
         || normalized.contains("members-only")
         || normalized.contains("authentication")
         || normalized.contains("private video")
+        || normalized.contains("premium")
+}
+
+fn looks_like_public_video_failure(message: &str) -> bool {
+    let normalized = message.to_lowercase();
+
+    // When cookies are present but expired/invalid, the default extractor
+    // may fail with generic availability errors on public videos.
+    // This signals we should retry without cookies (using android_vr fallback).
+    normalized.contains("not available")
+        || normalized.contains("video unavailable")
+        || normalized.contains("unavailable")
+        || normalized.contains("this video is private")
+        || normalized.contains("sign in")
+        || normalized.contains("confirm you're not a bot")
+        || normalized.contains("members-only")
+        || normalized.contains("authentication")
         || normalized.contains("premium")
 }

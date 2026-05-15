@@ -79,15 +79,6 @@ const AUDIO_TARGETS: Array<{ value: AudioTarget; label: string; hint: string }> 
   },
 ];
 
-const VIDEO_TARGETS: Array<{ value: VideoTarget; label: string; hint: string }> = [
-  { value: 'general', label: 'General video', hint: 'Keep the selected container and quality.' },
-  {
-    value: 'google_tv_cast',
-    label: 'Google TV Streamer Cast',
-    hint: 'MP4 H.264 High 5.1, yuv420p, AAC stereo 48 kHz, 24 fps, faststart.',
-  },
-];
-
 const LOUDNESS_PRESETS = [
   { value: -14, label: 'Streaming loud' },
   { value: -16, label: 'Podcast / web' },
@@ -251,22 +242,6 @@ const savedCookiesHelpText = computed(() =>
     ? 'MediaToolsPro will use the saved internal copy even if the original export gets moved or deleted.'
     : 'Import a cookies.txt export only when a source needs an authenticated session.',
 );
-const downloadVideoTargetSummary = computed(() => {
-  return (
-    VIDEO_TARGETS.find((target) => target.value === downloadVideoTarget.value)?.hint ??
-    'General video export'
-  );
-});
-const downloadTargetSummary = computed(() => {
-  if (!isAudioDownload.value) {
-    return downloadVideoTargetSummary.value;
-  }
-
-  return (
-    AUDIO_TARGETS.find((target) => target.value === downloadAudioTarget.value)?.hint ??
-    'General audio export'
-  );
-});
 const currentPlaylistModeHint = computed(() => {
   return PLAYLIST_MODES.find((mode) => mode.value === playlistMode.value)?.hint ?? '';
 });
@@ -447,31 +422,12 @@ const downloadSummaryRows = computed<SummaryRow[]>(() => {
       value: resolvedDownloadPath.value,
       detail: downloadDestinationMode.value === 'custom' ? 'Custom folder' : 'System Downloads folder',
     },
+    {
+      label: 'Cookies',
+      value: downloadAccessSummary.value,
+      detail: 'Optional. Import a cookies.txt export only when the source needs an authenticated session.',
+    },
   );
-
-  if (isAudioDownload.value) {
-    rows.push({
-      label: 'Audio target',
-      value:
-        AUDIO_TARGETS.find((target) => target.value === downloadAudioTarget.value)?.label ??
-        'General audio',
-      detail: downloadTargetSummary.value,
-    });
-  } else {
-    rows.push({
-      label: 'Video target',
-      value:
-        VIDEO_TARGETS.find((target) => target.value === downloadVideoTarget.value)?.label ??
-        'General video',
-      detail: downloadVideoTargetSummary.value,
-    });
-  }
-
-  rows.push({
-    label: 'Cookies',
-    value: downloadAccessSummary.value,
-    detail: 'Optional. Import a cookies.txt export only when the source needs an authenticated session.',
-  });
 
   return rows;
 });
@@ -1109,14 +1065,6 @@ function buildDownloadDetail(request: DownloadJobRequest) {
     `Output: ${request.outputPath}`,
   ];
 
-  if (request.audioTarget === 'azuracast') {
-    parts.push('AzuraCast Ready');
-  }
-
-  if (request.videoTarget === 'google_tv_cast') {
-    parts.push('Google TV Streamer Cast');
-  }
-
   if (request.cookiesFile) {
     parts.push('Cookies file: saved internally');
   }
@@ -1399,35 +1347,14 @@ function buildCurrentProcessSettings(
 }
 
 function buildCurrentDownloadSettings(outputPath: string): Omit<DownloadJobRequest, 'kind' | 'url'> {
-  const effectiveAudioTarget: AudioTarget =
-    downloadAudioTarget.value === 'azuracast' && isAudioDownload.value
-      ? 'azuracast'
-      : 'general';
-  const effectiveVideoTarget: VideoTarget =
-    !isAudioDownload.value && downloadVideoTarget.value === 'google_tv_cast'
-      ? 'google_tv_cast'
-      : 'general';
-  const effectiveFormat =
-    effectiveAudioTarget === 'azuracast' || effectiveVideoTarget === 'google_tv_cast'
-      ? effectiveAudioTarget === 'azuracast'
-        ? 'mp3'
-        : 'mp4'
-      : format.value;
-  const effectiveQuality =
-    effectiveAudioTarget === 'azuracast'
-      ? '320'
-      : effectiveVideoTarget === 'google_tv_cast'
-        ? '2160'
-        : quality.value;
-
   return {
-    format: effectiveFormat,
-    quality: effectiveQuality,
+    format: format.value,
+    quality: quality.value,
     formatId: selectedFormatId.value ?? undefined,
     outputPath,
     playlistMode: playlistMode.value,
-    audioTarget: effectiveAudioTarget,
-    videoTarget: effectiveVideoTarget,
+    audioTarget: 'general',
+    videoTarget: 'general',
     cookiesFile: cookiesFile.value.trim() || undefined,
   };
 }
@@ -3347,45 +3274,10 @@ onUnmounted(() => {
                   </button>
                 </section>
 
-                <section v-if="isAudioDownload" class="rounded-[26px] border border-white/10 bg-[#060d18] p-5 space-y-4">
+                <section class="rounded-[26px] border border-white/10 bg-[#060d18] p-5 space-y-4">
                   <div>
-                    <p class="text-xs uppercase tracking-[0.22em] text-slate-400">Audio target</p>
-                    <p class="text-sm text-slate-300 mt-2">Pick a delivery profile for audio exports.</p>
-                  </div>
-                  <div class="grid grid-cols-1 gap-3">
-                    <button
-                      v-for="target in AUDIO_TARGETS"
-                      :key="target.value"
-                      @click="downloadAudioTarget = target.value"
-                      class="rounded-2xl border px-4 py-4 text-left transition-colors"
-                      :class="downloadAudioTarget === target.value
-                        ? 'border-cyan-400/35 bg-cyan-400/[0.08] text-white'
-                        : 'border-white/10 bg-white/[0.02] text-slate-300 hover:border-cyan-400/20'"
-                    >
-                      <div class="text-sm font-medium">{{ target.label }}</div>
-                      <div class="text-xs text-slate-400 mt-1">{{ target.hint }}</div>
-                    </button>
-                  </div>
-                </section>
-
-                <section v-else class="rounded-[26px] border border-white/10 bg-[#060d18] p-5 space-y-4">
-                  <div>
-                    <p class="text-xs uppercase tracking-[0.22em] text-slate-400">Video target</p>
-                    <p class="text-sm text-slate-300 mt-2">Pick a delivery profile for video downloads.</p>
-                  </div>
-                  <div class="grid grid-cols-1 gap-3">
-                    <button
-                      v-for="target in VIDEO_TARGETS"
-                      :key="target.value"
-                      @click="downloadVideoTarget = target.value"
-                      class="rounded-2xl border px-4 py-4 text-left transition-colors"
-                      :class="downloadVideoTarget === target.value
-                        ? 'border-cyan-400/35 bg-cyan-400/[0.08] text-white'
-                        : 'border-white/10 bg-white/[0.02] text-slate-300 hover:border-cyan-400/20'"
-                    >
-                      <div class="text-sm font-medium">{{ target.label }}</div>
-                      <div class="text-xs text-slate-400 mt-1">{{ target.hint }}</div>
-                    </button>
+                    <p class="text-xs uppercase tracking-[0.22em] text-slate-400">Note</p>
+                    <p class="text-sm text-slate-300 mt-2">Download keeps the source quality. Use the Process tab to apply delivery profiles like AzuraCast or Google TV Streamer Cast.</p>
                   </div>
                 </section>
               </template>
