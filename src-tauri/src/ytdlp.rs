@@ -123,15 +123,33 @@ pub async fn list_formats<R: Runtime>(
         "--no-playlist".to_string(),
     ];
 
-    if is_youtube_url(&request.url) {
+    let cookies_path = request
+        .cookies_file
+        .as_ref()
+        .and_then(|v| {
+            let trimmed = v.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        });
+    let has_cookies = cookies_path
+        .as_ref()
+        .map(|p| Path::new(p).is_file())
+        .unwrap_or(false);
+
+    if is_youtube_url(&request.url) && !has_cookies {
+        // Fallback extractor for public videos when no cookies are available
+        // to avoid PO-Token gated 403 failures.
         args.push("--extractor-args".to_string());
         args.push("youtube:player_client=android_vr".to_string());
     }
 
-    if let Some(cookies_file) = request.cookies_file.as_ref().filter(|v| !v.trim().is_empty()) {
-        if Path::new(cookies_file.trim()).is_file() {
+    if has_cookies {
+        if let Some(path) = cookies_path {
             args.push("--cookies".to_string());
-            args.push(cookies_file.trim().to_string());
+            args.push(path);
         }
     }
 
@@ -366,27 +384,23 @@ async fn run_download_process<R: Runtime>(
         "after_move:filepath".to_string(),
     ];
 
-    if is_youtube_url(&request.url) {
+    let has_cookies = request
+        .cookies_file
+        .as_ref()
+        .filter(|value| !value.trim().is_empty())
+        .map(|p| Path::new(p.trim()).is_file())
+        .unwrap_or(false);
+
+    if is_youtube_url(&request.url) && !has_cookies {
         // Use a YouTube client that currently avoids PO-Token-gated 403 failures
         // on public media downloads more reliably than the default client selection.
         args.push("--extractor-args".to_string());
         args.push("youtube:player_client=android_vr".to_string());
     }
 
-    if let Some(cookies_file) = request
-        .cookies_file
-        .as_ref()
-        .filter(|value| !value.trim().is_empty())
-    {
-        if !Path::new(cookies_file.trim()).is_file() {
-            return Err(
-                "The saved internal cookies.txt is missing. Import a fresh cookies.txt from the app before downloading protected content."
-                    .into(),
-            );
-        }
-
+    if has_cookies {
         args.push("--cookies".to_string());
-        args.push(cookies_file.trim().to_string());
+        args.push(request.cookies_file.as_ref().unwrap().trim().to_string());
     }
 
     match request.playlist_mode.as_deref() {
