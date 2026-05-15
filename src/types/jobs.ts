@@ -31,6 +31,7 @@ export interface DownloadJobRequest {
   url: string;
   format: string;
   quality: string;
+  formatId?: string;
   outputPath: string;
   playlistMode: PlaylistMode;
   audioTarget: AudioTarget;
@@ -108,6 +109,27 @@ export interface JobProgressPayload {
   detail?: string | null;
   outputPath?: string | null;
   error?: string | null;
+}
+
+export interface YtdlpFormatItem {
+  formatId: string;
+  ext: string;
+  resolution: string;
+  fps?: number;
+  vcodec?: string;
+  acodec?: string;
+  filesize?: number;
+  filesizeApprox?: number;
+  formatNote: string;
+  hasVideo: boolean;
+  hasAudio: boolean;
+}
+
+export interface YtdlpFormatsResponse {
+  title: string;
+  duration?: number;
+  thumbnail?: string;
+  formats: YtdlpFormatItem[];
 }
 
 export interface MediaProbeResponse {

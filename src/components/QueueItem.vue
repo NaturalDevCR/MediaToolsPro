@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed } from 'vue';
-import { FileAudio, FileVideo, FolderOpen, X } from 'lucide-vue-next';
+import { FileAudio, FileVideo, FolderOpen, X, Wrench } from 'lucide-vue-next';
 import type { QueueItemData } from '../types/jobs';
 
 const props = defineProps<{
@@ -10,6 +10,7 @@ const props = defineProps<{
 const emit = defineEmits<{
   (e: 'cancel', id: string): void;
   (e: 'reveal', path: string): void;
+  (e: 'process', path: string): void;
 }>();
 
 const statusColor = computed(() => {
@@ -96,6 +97,15 @@ const canRevealOutput = computed(() => props.item.status === 'done' && Boolean(p
               title="Show in folder"
             >
               <FolderOpen class="w-4 h-4" />
+            </button>
+
+            <button
+              v-if="item.status === 'done' && item.outputPath"
+              @click="emit('process', item.outputPath)"
+              class="text-slate-400 hover:text-emerald-300 transition-colors p-1 rounded-md hover:bg-emerald-50 dark:hover:bg-emerald-900/20"
+              title="Send to Process"
+            >
+              <Wrench class="w-4 h-4" />
             </button>
 
             <button

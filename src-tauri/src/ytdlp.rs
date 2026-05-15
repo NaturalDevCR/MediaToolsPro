@@ -2,7 +2,7 @@ use crate::jobs::{
     emit_job_progress, emit_log, media_kind_for_format, JobProgressPayload, JobState,
 };
 use regex::Regex;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -21,11 +21,44 @@ pub struct DownloadRequest {
     pub url: String,
     pub format: String,
     pub quality: String,
+    pub format_id: Option<String>,
     pub output_path: String,
     pub playlist_mode: Option<String>,
     pub audio_target: Option<String>,
     pub video_target: Option<String>,
     pub cookies_file: Option<String>,
+}
+
+#[derive(Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ListFormatsRequest {
+    pub url: String,
+    pub cookies_file: Option<String>,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct YtdlpFormatItem {
+    pub format_id: String,
+    pub ext: String,
+    pub resolution: String,
+    pub fps: Option<f64>,
+    pub vcodec: Option<String>,
+    pub acodec: Option<String>,
+    pub filesize: Option<u64>,
+    pub filesize_approx: Option<u64>,
+    pub format_note: String,
+    pub has_video: bool,
+    pub has_audio: bool,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct YtdlpFormatsResponse {
+    pub title: String,
+    pub duration: Option<f64>,
+    pub thumbnail: Option<String>,
+    pub formats: Vec<YtdlpFormatItem>,
 }
 
 #[tauri::command]
@@ -65,6 +98,128 @@ pub fn clear_saved_cookies_file<R: Runtime>(app: AppHandle<R>) -> Result<(), Str
         fs::remove_file(target).map_err(|error| error.to_string())?;
     }
     Ok(())
+}
+
+#[tauri::command]
+pub async fn list_formats<R: Runtime>(
+    app: AppHandle<R>,
+    request: ListFormatsRequest,
+) -> Result<YtdlpFormatsResponse, String> {
+    let bin_dir = app.path().app_data_dir().unwrap().join("bin");
+    let ytdlp_path = bin_dir.join(if cfg!(windows) {
+        "yt-dlp.exe"
+    } else {
+        "yt-dlp"
+    });
+
+    if !ytdlp_path.exists() {
+        return Err("yt-dlp binary is missing. Install it from Settings first.".into());
+    }
+
+    let mut args = vec![
+        "--dump-single-json".to_string(),
+        "--no-download".to_string(),
+        "--no-warnings".to_string(),
+        "--no-playlist".to_string(),
+    ];
+
+    if is_youtube_url(&request.url) {
+        args.push("--extractor-args".to_string());
+        args.push("youtube:player_client=android_vr".to_string());
+    }
+
+    if let Some(cookies_file) = request.cookies_file.as_ref().filter(|v| !v.trim().is_empty()) {
+        if Path::new(cookies_file.trim()).is_file() {
+            args.push("--cookies".to_string());
+            args.push(cookies_file.trim().to_string());
+        }
+    }
+
+    args.push(request.url.clone());
+
+    let output = std::process::Command::new(&ytdlp_path)
+        .args(&args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|e| e.to_string())?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let excerpt = stderr
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .last()
+            .unwrap_or("yt-dlp exited with an error");
+        return Err(excerpt.to_string());
+    }
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).map_err(|e| format!("Failed to parse yt-dlp output: {}", e))?;
+
+    let title = json["title"].as_str().unwrap_or(&request.url).to_string();
+    let duration = json["duration"].as_f64();
+    let thumbnail = json["thumbnail"].as_str().map(|s| s.to_string());
+
+    let mut formats: Vec<YtdlpFormatItem> = Vec::new();
+
+    if let Some(array) = json["formats"].as_array() {
+        for entry in array {
+            let format_id = entry["format_id"].as_str().unwrap_or("").to_string();
+            if format_id.is_empty() {
+                continue;
+            }
+
+            let vcodec = entry["vcodec"].as_str().unwrap_or("none");
+            let acodec = entry["acodec"].as_str().unwrap_or("none");
+            let has_video = vcodec != "none";
+            let has_audio = acodec != "none";
+
+            formats.push(YtdlpFormatItem {
+                format_id: format_id.clone(),
+                ext: entry["ext"].as_str().unwrap_or("").to_string(),
+                resolution: entry["resolution"].as_str().unwrap_or("").to_string(),
+                fps: entry["fps"].as_f64(),
+                vcodec: if has_video { Some(vcodec.to_string()) } else { None },
+                acodec: if has_audio { Some(acodec.to_string()) } else { None },
+                filesize: entry["filesize"].as_u64(),
+                filesize_approx: entry["filesize_approx"].as_u64(),
+                format_note: entry["format_note"].as_str().unwrap_or("").to_string(),
+                has_video,
+                has_audio,
+            });
+        }
+    }
+
+    // Also include format entries from info dict if formats array is empty
+    if formats.is_empty() {
+        if let Some(fmt) = json["format_id"].as_str() {
+            let vcodec = json["vcodec"].as_str().unwrap_or("none");
+            let acodec = json["acodec"].as_str().unwrap_or("none");
+            let has_video = vcodec != "none";
+            let has_audio = acodec != "none";
+            formats.push(YtdlpFormatItem {
+                format_id: fmt.to_string(),
+                ext: json["ext"].as_str().unwrap_or("").to_string(),
+                resolution: json["resolution"].as_str().unwrap_or("").to_string(),
+                fps: json["fps"].as_f64(),
+                vcodec: if has_video { Some(vcodec.to_string()) } else { None },
+                acodec: if has_audio { Some(acodec.to_string()) } else { None },
+                filesize: json["filesize"].as_u64(),
+                filesize_approx: json["filesize_approx"].as_u64(),
+                format_note: json["format_note"].as_str().unwrap_or("").to_string(),
+                has_video,
+                has_audio,
+            });
+        }
+    }
+
+    Ok(YtdlpFormatsResponse {
+        title,
+        duration,
+        thumbnail,
+        formats,
+    })
 }
 
 #[tauri::command]
@@ -242,7 +397,35 @@ async fn run_download_process<R: Runtime>(
         _ => args.push("--no-playlist".to_string()),
     }
 
-    if matches!(
+    if let Some(format_id) = request.format_id.as_ref().filter(|v| !v.is_empty()) {
+        // User picked an exact format from the explorer
+        args.push("-f".to_string());
+        args.push(format_id.clone());
+
+        if is_audio_request {
+            args.push("-x".to_string());
+            args.push("--audio-format".to_string());
+            args.push(audio_format_for_ytdlp(&effective_format).to_string());
+
+            if effective_quality != "best" {
+                args.push("--audio-quality".to_string());
+                args.push(format!("{}K", effective_quality));
+            } else {
+                args.push("--audio-quality".to_string());
+                args.push("0".to_string());
+            }
+
+            if azuracast_target {
+                args.push("--postprocessor-args".to_string());
+                args.push(
+                    "ExtractAudio+ffmpeg_o:-ar 44100 -ac 2 -id3v2_version 3 -write_id3v1 1".to_string(),
+                );
+            }
+        } else {
+            args.push("--recode-video".to_string());
+            args.push(effective_format.clone());
+        }
+    } else if matches!(
         effective_format.as_str(),
         "mp3" | "wav" | "flac" | "m4a" | "aac" | "ogg" | "opus"
     ) {

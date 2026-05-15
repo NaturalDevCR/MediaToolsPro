@@ -21,7 +21,6 @@ import QueueItem from '../components/QueueItem.vue';
 import { addLog as pushLog } from '../stores/logs';
 import type {
   AudioTarget,
-  DownloadProcessJobRequest,
   DownloadJobRequest,
   EqualizerSettings,
   JobRequest,
@@ -36,6 +35,8 @@ import type {
   SplitMode,
   VideoTarget,
   WaveformPreviewResponse,
+  YtdlpFormatItem,
+  YtdlpFormatsResponse,
 } from '../types/jobs';
 
 type WorkspaceTab = 'downloads' | 'process' | 'split' | 'queue';
@@ -192,6 +193,14 @@ const queueFilter = ref<QueueFilter>('studio');
 const queue = ref<QueueItemData[]>([]);
 const unlisteners = ref<(() => void)[]>([]);
 
+// Format explorer state
+const downloadStep = ref<'url' | 'formats' | 'confirm'>('url');
+const formatList = ref<YtdlpFormatItem[]>([]);
+const selectedFormatId = ref<string | null>(null);
+const formatListLoading = ref(false);
+const formatListError = ref('');
+const formatListTitle = ref('');
+
 let waveformRequestToken = 0;
 let stopPointerTracking: (() => void) | null = null;
 let queuePersistenceTimer: number | null = null;
@@ -215,11 +224,15 @@ const audioPreviewUrl = computed(() => waveformPreview.value?.audioDataUrl ?? ''
 const resolvedDownloadPath = computed(() =>
   downloadDestinationMode.value === 'custom' ? downloadPath.value : systemDownloadDir.value,
 );
-const downloadFormatSummary = computed(() =>
-  isAudioDownload.value
+const downloadFormatSummary = computed(() => {
+  if (selectedFormat.value) {
+    const f = selectedFormat.value;
+    return `${f.resolution || f.formatNote || f.formatId} • ${f.ext.toUpperCase()}`;
+  }
+  return isAudioDownload.value
     ? `${format.value.toUpperCase()} • ${quality.value === 'best' ? 'Best available' : `${quality.value} kbps`}`
-    : `${format.value.toUpperCase()} • ${quality.value === 'best' ? 'Best available' : `${quality.value}p`}`,
-);
+    : `${format.value.toUpperCase()} • ${quality.value === 'best' ? 'Best available' : `${quality.value}p`}`;
+});
 const downloadAccessSummary = computed(() => {
   if (cookiesFile.value.trim()) {
     return 'Saved internally';
@@ -284,6 +297,15 @@ const downloadReady = computed(() => {
   }
 
   return true;
+});
+
+const selectedFormat = computed<YtdlpFormatItem | null>(() => {
+  if (!selectedFormatId.value) return null;
+  return formatList.value.find((f) => f.formatId === selectedFormatId.value) ?? null;
+});
+
+const canConfirmDownload = computed(() => {
+  return selectedFormatId.value !== null && downloadReady.value;
 });
 const canQueueBatch = computed(() => {
   if (!batchFiles.value.length) {
@@ -353,43 +375,7 @@ const processSummary = computed(() => {
 
   return parts.join(' • ');
 });
-const currentDownloadModeLabel = computed(() => (isAudioStudio.value ? 'audio' : 'video'));
 const currentProcessModeLabel = computed(() => (isAudioStudio.value ? 'audio mastering' : 'video finishing'));
-const currentPipelineDestination = computed(() =>
-  downloadDestinationMode.value === 'custom' ? downloadPath.value || 'Choose final folder' : systemDownloadDir.value,
-);
-const downloadPipelineSummaryRows = computed<SummaryRow[]>(() => {
-  const rows: SummaryRow[] = [
-    { label: 'Export', value: `Process to ${batchFormat.value.toUpperCase()}` },
-    { label: 'Output', value: currentPipelineDestination.value },
-  ];
-
-  if (isAudioStudio.value) {
-    rows.push({ label: 'Audio chain', value: processingToneSummary.value });
-  }
-
-  if (downloadPipelineSplitMode.value === 'silence') {
-    rows.push({
-      label: 'Split',
-      value: `Silence ${downloadPipelineSilence.value.thresholdDb} dB • ${downloadPipelineSilence.value.minSilenceDuration}s`,
-      detail: `Minimum segment ${downloadPipelineSilence.value.minSegmentDuration}s`,
-    });
-  } else if (downloadPipelineSplitMode.value === 'chapters') {
-    rows.push({
-      label: 'Split',
-      value: 'Source chapters',
-      detail: 'Falls back to silence detection when the source has no embedded chapter marks.',
-    });
-  } else {
-    rows.push({
-      label: 'Split',
-      value: 'No auto split',
-      detail: 'Trim waveform editing and manual marks remain available only for local files.',
-    });
-  }
-
-  return rows;
-});
 const processingToneSummary = computed(() => {
   if (!isAudioBatch.value) {
     return 'Video processing keeps export and trim controls only.';
@@ -438,8 +424,19 @@ const splitContextSummary = computed(() => {
   return 'Single trimmed output only. No extra split logic will be applied.';
 });
 const downloadSummaryRows = computed<SummaryRow[]>(() => {
-  const rows: SummaryRow[] = [
-    { label: 'Format', value: downloadFormatSummary.value },
+  const rows: SummaryRow[] = [];
+
+  if (selectedFormat.value) {
+    const f = selectedFormat.value;
+    rows.push({
+      label: 'Format ID',
+      value: f.formatId,
+      detail: `${f.resolution || f.formatNote || 'Unknown resolution'} • ${f.ext.toUpperCase()}${f.vcodec ? ` • ${f.vcodec}` : ''}${f.acodec ? ` • ${f.acodec}` : ''}`,
+    });
+  }
+
+  rows.push(
+    { label: 'Export preset', value: downloadFormatSummary.value },
     {
       label: 'Playlist',
       value: PLAYLIST_MODES.find((mode) => mode.value === playlistMode.value)?.label ?? 'Auto detect',
@@ -450,7 +447,7 @@ const downloadSummaryRows = computed<SummaryRow[]>(() => {
       value: resolvedDownloadPath.value,
       detail: downloadDestinationMode.value === 'custom' ? 'Custom folder' : 'System Downloads folder',
     },
-  ];
+  );
 
   if (isAudioDownload.value) {
     rows.push({
@@ -533,6 +530,14 @@ const splitSummaryRows = computed<SummaryRow[]>(() => {
   return rows;
 });
 const generateId = () => `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
+
+function formatBytes(bytes: number) {
+  if (!bytes || bytes === 0) return 'Unknown size';
+  const sizes = ['B', 'KB', 'MB', 'GB'];
+  const i = Math.floor(Math.log(bytes) / Math.log(1024));
+  return `${(bytes / Math.pow(1024, i)).toFixed(2)} ${sizes[i]}`;
+}
+
 const addLog = (
   message: string,
   level: 'info' | 'warn' | 'error' | 'success' = 'info',
@@ -1100,6 +1105,7 @@ function buildDownloadQualityOptions() {
 function buildDownloadDetail(request: DownloadJobRequest) {
   const parts = [
     PLAYLIST_MODES.find((mode) => mode.value === request.playlistMode)?.label ?? 'Auto detect',
+    request.formatId ? `Format ID: ${request.formatId}` : `${request.format.toUpperCase()} ${request.quality}`,
     `Output: ${request.outputPath}`,
   ];
 
@@ -1116,15 +1122,6 @@ function buildDownloadDetail(request: DownloadJobRequest) {
   }
 
   return parts.join(' • ');
-}
-
-function buildPipelineDetail(request: DownloadProcessJobRequest) {
-  return [
-    `Download temp ${request.downloadFormat.toUpperCase()} ${request.downloadQuality !== 'best' ? request.downloadQuality : 'best'}`,
-    `Process to ${request.process.format.toUpperCase()}`,
-    `Final output: ${request.outputDir}`,
-    buildProcessDetail({ kind: 'process', inputPath: '', outputDir: request.outputDir, ...request.process }),
-  ].join(' • ');
 }
 
 async function restoreSavedCookiesFile() {
@@ -1426,12 +1423,50 @@ function buildCurrentDownloadSettings(outputPath: string): Omit<DownloadJobReque
   return {
     format: effectiveFormat,
     quality: effectiveQuality,
+    formatId: selectedFormatId.value ?? undefined,
     outputPath,
     playlistMode: playlistMode.value,
     audioTarget: effectiveAudioTarget,
     videoTarget: effectiveVideoTarget,
     cookiesFile: cookiesFile.value.trim() || undefined,
   };
+}
+
+async function exploreFormats() {
+  const trimmedUrl = url.value.trim();
+  if (!trimmedUrl) return;
+
+  formatListLoading.value = true;
+  formatListError.value = '';
+  formatList.value = [];
+  selectedFormatId.value = null;
+
+    try {
+      const response = await invoke<YtdlpFormatsResponse>('list_formats', {
+        request: {
+          url: trimmedUrl,
+          cookiesFile: cookiesFile.value.trim() || undefined,
+        },
+      });
+    formatList.value = response.formats;
+    formatListTitle.value = response.title;
+    downloadStep.value = 'formats';
+    addLog(`Explored formats for: ${trimmedUrl} (${response.formats.length} formats)`, 'info');
+  } catch (error) {
+    const message = String(error);
+    formatListError.value = message;
+    addLog(`Failed to list formats: ${message}`, 'error');
+  } finally {
+    formatListLoading.value = false;
+  }
+}
+
+function resetFormatExplorer() {
+  downloadStep.value = 'url';
+  formatList.value = [];
+  selectedFormatId.value = null;
+  formatListError.value = '';
+  formatListTitle.value = '';
 }
 
 async function addDownloadToQueue() {
@@ -1479,63 +1514,7 @@ async function addDownloadToQueue() {
 
   addLog(`Added download job: ${trimmedUrl}`, 'info');
   url.value = '';
-  activeTab.value = 'queue';
-  processQueue();
-}
-
-async function addDownloadProcessToQueue() {
-  const trimmedUrl = url.value.trim();
-  if (!trimmedUrl) {
-    return;
-  }
-
-  if (downloadDestinationMode.value === 'custom' && !downloadPath.value) {
-    addLog('Choose the final output folder before queueing a download/process pipeline.', 'warn');
-    return;
-  }
-
-  if (cookiesFile.value.trim()) {
-    const savedCookiesAvailable = await ensureSavedCookiesFileAvailable();
-    if (!savedCookiesAvailable) {
-      return;
-    }
-  }
-
-  const downloadSettings = buildCurrentDownloadSettings('');
-  const processSettings = buildCurrentProcessSettings('pipeline');
-  const request: DownloadProcessJobRequest = {
-    kind: 'downloadProcess',
-    url: trimmedUrl,
-    downloadFormat: downloadSettings.format,
-    downloadQuality: downloadSettings.quality,
-    outputDir: resolvedDownloadPath.value,
-    playlistMode: downloadSettings.playlistMode,
-    audioTarget: downloadSettings.audioTarget,
-    videoTarget: downloadSettings.videoTarget,
-    cookiesFile: downloadSettings.cookiesFile,
-    process: processSettings,
-    cleanupTemp: true,
-  };
-
-  queue.value.unshift({
-    id: generateId(),
-    kind: 'pipeline',
-    mediaKind: studioMode.value,
-    format: request.process.format,
-    quality: request.downloadQuality,
-    status: 'waiting',
-    percent: 0,
-    speed: '-',
-    eta: '-',
-    totalSize: '-',
-    title: trimmedUrl,
-    source: trimmedUrl,
-    detail: buildPipelineDetail(request),
-    request,
-  });
-
-  addLog(`Added download/process pipeline: ${trimmedUrl}`, 'info');
-  url.value = '';
+  resetFormatExplorer();
   activeTab.value = 'queue';
   processQueue();
 }
@@ -1639,6 +1618,12 @@ async function revealQueueOutput(path: string) {
   } catch (error) {
     addLog(`Failed to open output folder: ${String(error)}`, 'error');
   }
+}
+
+function sendToProcess(path: string) {
+  batchFiles.value = [path];
+  activeTab.value = 'process';
+  addLog(`Sent ${basename(path)} to Process`, 'info');
 }
 
 function updateQueueItem(payload: JobProgressPayload) {
@@ -2166,6 +2151,12 @@ watch(studioMode, (nextMode, previousMode) => {
   addLog(`Switched to ${nextMode === 'audio' ? 'Audio' : 'Video'} Studio`, 'info');
 });
 
+watch(url, () => {
+  if (downloadStep.value !== 'url') {
+    resetFormatExplorer();
+  }
+});
+
 watch(format, (nextFormat) => {
   if (!activeDownloadFormats.value.includes(nextFormat)) {
     format.value = activeDownloadFormats.value[0] ?? 'mp3';
@@ -2365,116 +2356,179 @@ onUnmounted(() => {
       <template v-if="activeTab === 'downloads'">
         <section class="grid grid-cols-1 xl:grid-cols-[minmax(0,1.2fr)_360px] gap-5 xl:flex-1 xl:min-h-0">
           <div class="rounded-[28px] border border-white/10 bg-[#091626] shadow-[0_20px_60px_rgba(0,0,0,0.22)] p-6 md:p-7 space-y-5 xl:h-full xl:min-h-0 xl:overflow-y-auto">
-            <div class="space-y-2">
-              <p class="text-xs uppercase tracking-[0.24em] text-cyan-400/80 font-semibold">Capture</p>
-              <h2 class="text-2xl font-semibold text-slate-50">
-                Download {{ currentDownloadModeLabel }} cleanly
-              </h2>
-              <p class="text-sm text-slate-400 max-w-2xl">
-                Paste a URL, tune only what matters, then choose whether this should stop at download or continue directly into the current processing chain.
-              </p>
-            </div>
-
-            <div class="relative group">
-              <div class="absolute left-4 top-1/2 -translate-y-1/2 text-slate-500 pointer-events-none group-focus-within:text-cyan-400">
-                <Youtube class="w-5 h-5" />
+            <!-- Step 1: URL -->
+            <template v-if="downloadStep === 'url'">
+              <div class="space-y-2">
+                <p class="text-xs uppercase tracking-[0.24em] text-cyan-400/80 font-semibold">Step 1 of 3</p>
+                <h2 class="text-2xl font-semibold text-slate-50">Paste a URL</h2>
+                <p class="text-sm text-slate-400 max-w-2xl">Enter a video or playlist URL to discover available formats before downloading.</p>
               </div>
-              <input
-                v-model="url"
-                @keyup.enter="addDownloadToQueue"
-                type="text"
-                placeholder="Paste a video or playlist URL"
-                class="w-full h-14 rounded-2xl border border-white/10 bg-[#050c18] pl-12 pr-4 text-slate-100 placeholder:text-slate-500 focus:outline-none focus:ring-1 focus:ring-cyan-400/50 focus:border-cyan-400/40"
-              />
-            </div>
 
-            <div class="overflow-hidden rounded-[22px] border border-white/10 bg-[#060d18]">
-              <table class="w-full table-fixed border-collapse">
-                <tbody class="divide-y divide-white/10">
-                  <tr v-for="row in downloadSummaryRows" :key="row.label" class="align-top">
-                    <th class="w-[160px] px-4 py-3 text-left text-[11px] font-medium uppercase tracking-[0.22em] text-slate-500">
-                      {{ row.label }}
-                    </th>
-                    <td class="px-4 py-3">
-                      <div class="text-sm font-medium text-slate-100 break-words">{{ row.value }}</div>
-                      <div v-if="row.detail" class="mt-1 text-xs text-slate-400">{{ row.detail }}</div>
-                    </td>
-                  </tr>
-                </tbody>
-              </table>
-            </div>
+              <div class="relative group">
+                <div class="absolute left-4 top-1/2 -translate-y-1/2 text-slate-500 pointer-events-none group-focus-within:text-cyan-400">
+                  <Youtube class="w-5 h-5" />
+                </div>
+                <input
+                  v-model="url"
+                  @keyup.enter="exploreFormats"
+                  type="text"
+                  placeholder="Paste a video or playlist URL"
+                  class="w-full h-14 rounded-2xl border border-white/10 bg-[#050c18] pl-12 pr-4 text-slate-100 placeholder:text-slate-500 focus:outline-none focus:ring-1 focus:ring-cyan-400/50 focus:border-cyan-400/40"
+                />
+              </div>
+
+              <div v-if="formatListError" class="rounded-2xl border border-rose-400/20 bg-rose-400/[0.06] px-4 py-3 text-sm text-rose-100">
+                {{ formatListError }}
+              </div>
+
+              <div class="overflow-hidden rounded-[22px] border border-white/10 bg-[#060d18]">
+                <table class="w-full table-fixed border-collapse">
+                  <tbody class="divide-y divide-white/10">
+                    <tr v-for="row in downloadSummaryRows" :key="row.label" class="align-top">
+                      <th class="w-[160px] px-4 py-3 text-left text-[11px] font-medium uppercase tracking-[0.22em] text-slate-500">{{ row.label }}</th>
+                      <td class="px-4 py-3">
+                        <div class="text-sm font-medium text-slate-100 break-words">{{ row.value }}</div>
+                        <div v-if="row.detail" class="mt-1 text-xs text-slate-400">{{ row.detail }}</div>
+                      </td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            </template>
+
+            <!-- Step 2: Pick format -->
+            <template v-else-if="downloadStep === 'formats'">
+              <div class="space-y-2">
+                <div class="flex items-center gap-3">
+                  <p class="text-xs uppercase tracking-[0.24em] text-cyan-400/80 font-semibold">Step 2 of 3</p>
+                  <button @click="resetFormatExplorer" class="text-xs text-cyan-300 hover:text-cyan-200 transition-colors">Change URL</button>
+                </div>
+                <h2 class="text-2xl font-semibold text-slate-50">Pick a format</h2>
+                <p v-if="formatListTitle" class="text-sm text-slate-300">{{ formatListTitle }}</p>
+              </div>
+
+              <div v-if="!formatList.length" class="rounded-2xl border border-dashed border-white/10 bg-white/[0.02] px-4 py-8 text-sm text-slate-400 text-center">
+                No formats returned for this URL. Try a different link or check your cookies.
+              </div>
+
+              <div class="space-y-3">
+                <!-- Combined formats -->
+                <div v-if="formatList.filter((f) => f.hasVideo && f.hasAudio).length">
+                  <p class="text-xs uppercase tracking-[0.22em] text-slate-400 mb-2">Video + Audio</p>
+                  <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2">
+                    <button
+                      v-for="fmt in formatList.filter((f) => f.hasVideo && f.hasAudio)"
+                      :key="fmt.formatId"
+                      @click="selectedFormatId = fmt.formatId"
+                      class="rounded-2xl border px-4 py-3 text-left transition-colors"
+                      :class="selectedFormatId === fmt.formatId
+                        ? 'border-cyan-400/40 bg-cyan-400/[0.10] text-white'
+                        : 'border-white/10 bg-[#060d18] text-slate-300 hover:border-cyan-400/20'"
+                    >
+                      <div class="text-sm font-medium">{{ fmt.resolution || fmt.formatNote || fmt.formatId }}</div>
+                      <div class="text-[11px] text-slate-400 mt-1">
+                        {{ fmt.ext.toUpperCase() }}
+                        <span v-if="fmt.fps"> • {{ fmt.fps }}fps</span>
+                        <span v-if="fmt.vcodec"> • {{ fmt.vcodec.split('.')[0] }}</span>
+                        <span v-if="fmt.acodec"> • {{ fmt.acodec.split('.')[0] }}</span>
+                        <span v-if="fmt.filesize || fmt.filesizeApprox"> • {{ formatBytes(fmt.filesize || fmt.filesizeApprox || 0) }}</span>
+                      </div>
+                      <div class="text-[10px] text-slate-500 mt-0.5">ID: {{ fmt.formatId }}</div>
+                    </button>
+                  </div>
+                </div>
+
+                <!-- Audio only -->
+                <div v-if="formatList.filter((f) => !f.hasVideo && f.hasAudio).length">
+                  <p class="text-xs uppercase tracking-[0.22em] text-slate-400 mb-2">Audio only</p>
+                  <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2">
+                    <button
+                      v-for="fmt in formatList.filter((f) => !f.hasVideo && f.hasAudio)"
+                      :key="fmt.formatId"
+                      @click="selectedFormatId = fmt.formatId"
+                      class="rounded-2xl border px-4 py-3 text-left transition-colors"
+                      :class="selectedFormatId === fmt.formatId
+                        ? 'border-cyan-400/40 bg-cyan-400/[0.10] text-white'
+                        : 'border-white/10 bg-[#060d18] text-slate-300 hover:border-cyan-400/20'"
+                    >
+                      <div class="text-sm font-medium">{{ fmt.formatNote || fmt.formatId }}</div>
+                      <div class="text-[11px] text-slate-400 mt-1">
+                        {{ fmt.ext.toUpperCase() }}
+                        <span v-if="fmt.acodec"> • {{ fmt.acodec.split('.')[0] }}</span>
+                        <span v-if="fmt.filesize || fmt.filesizeApprox"> • {{ formatBytes(fmt.filesize || fmt.filesizeApprox || 0) }}</span>
+                      </div>
+                      <div class="text-[10px] text-slate-500 mt-0.5">ID: {{ fmt.formatId }}</div>
+                    </button>
+                  </div>
+                </div>
+
+                <!-- Video only -->
+                <div v-if="formatList.filter((f) => f.hasVideo && !f.hasAudio).length">
+                  <p class="text-xs uppercase tracking-[0.22em] text-slate-400 mb-2">Video only (no audio)</p>
+                  <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2">
+                    <button
+                      v-for="fmt in formatList.filter((f) => f.hasVideo && !f.hasAudio)"
+                      :key="fmt.formatId"
+                      @click="selectedFormatId = fmt.formatId"
+                      class="rounded-2xl border px-4 py-3 text-left transition-colors"
+                      :class="selectedFormatId === fmt.formatId
+                        ? 'border-cyan-400/40 bg-cyan-400/[0.10] text-white'
+                        : 'border-white/10 bg-[#060d18] text-slate-300 hover:border-cyan-400/20'"
+                    >
+                      <div class="text-sm font-medium">{{ fmt.resolution || fmt.formatNote || fmt.formatId }}</div>
+                      <div class="text-[11px] text-slate-400 mt-1">
+                        {{ fmt.ext.toUpperCase() }}
+                        <span v-if="fmt.fps"> • {{ fmt.fps }}fps</span>
+                        <span v-if="fmt.vcodec"> • {{ fmt.vcodec.split('.')[0] }}</span>
+                        <span v-if="fmt.filesize || fmt.filesizeApprox"> • {{ formatBytes(fmt.filesize || fmt.filesizeApprox || 0) }}</span>
+                      </div>
+                      <div class="text-[10px] text-slate-500 mt-0.5">ID: {{ fmt.formatId }}</div>
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </template>
+
+            <!-- Step 3: Confirm -->
+            <template v-else-if="downloadStep === 'confirm'">
+              <div class="space-y-2">
+                <div class="flex items-center gap-3">
+                  <p class="text-xs uppercase tracking-[0.24em] text-cyan-400/80 font-semibold">Step 3 of 3</p>
+                  <button @click="downloadStep = 'formats'" class="text-xs text-cyan-300 hover:text-cyan-200 transition-colors">Change format</button>
+                </div>
+                <h2 class="text-2xl font-semibold text-slate-50">Confirm download</h2>
+                <p v-if="formatListTitle" class="text-sm text-slate-300">{{ formatListTitle }}</p>
+              </div>
+
+              <div v-if="selectedFormat" class="rounded-[22px] border border-cyan-400/20 bg-cyan-400/[0.06] p-4 space-y-2">
+                <p class="text-xs uppercase tracking-[0.18em] text-cyan-200/80">Selected format</p>
+                <div class="text-sm font-medium text-slate-100">{{ selectedFormat.resolution || selectedFormat.formatNote || selectedFormat.formatId }}</div>
+                <div class="text-xs text-slate-400">
+                  {{ selectedFormat.ext.toUpperCase() }}
+                  <span v-if="selectedFormat.vcodec"> • Video: {{ selectedFormat.vcodec }}</span>
+                  <span v-if="selectedFormat.acodec"> • Audio: {{ selectedFormat.acodec }}</span>
+                  <span v-if="selectedFormat.filesize || selectedFormat.filesizeApprox"> • Size: {{ formatBytes(selectedFormat.filesize || selectedFormat.filesizeApprox || 0) }}</span>
+                </div>
+                <div class="text-[11px] text-slate-500">Format ID: {{ selectedFormat.formatId }}</div>
+              </div>
+
+              <div class="overflow-hidden rounded-[22px] border border-white/10 bg-[#060d18]">
+                <table class="w-full table-fixed border-collapse">
+                  <tbody class="divide-y divide-white/10">
+                    <tr v-for="row in downloadSummaryRows" :key="row.label" class="align-top">
+                      <th class="w-[160px] px-4 py-3 text-left text-[11px] font-medium uppercase tracking-[0.22em] text-slate-500">{{ row.label }}</th>
+                      <td class="px-4 py-3">
+                        <div class="text-sm font-medium text-slate-100 break-words">{{ row.value }}</div>
+                        <div v-if="row.detail" class="mt-1 text-xs text-slate-400">{{ row.detail }}</div>
+                      </td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            </template>
           </div>
 
           <aside class="rounded-[28px] border border-white/10 bg-[#0b1625] p-5 space-y-4 xl:h-full xl:min-h-0 overflow-y-auto">
-            <div class="rounded-[22px] border border-white/10 bg-[#060d18] p-4 space-y-4">
-              <div>
-                <p class="text-[11px] uppercase tracking-[0.22em] text-slate-400">Pipeline-Safe Split Options</p>
-                <p class="text-xs text-slate-400 mt-1">
-                  These are the only split settings that can be chained from a URL before a file exists locally.
-                </p>
-              </div>
-
-              <div class="grid grid-cols-1 gap-2">
-                <button
-                  v-for="mode in SPLIT_MODES.filter((mode) => mode.value !== 'manual')"
-                  :key="`download-${mode.value}`"
-                  @click="downloadPipelineSplitMode = mode.value"
-                  class="rounded-2xl border px-3 py-3 text-left transition-colors"
-                  :class="downloadPipelineSplitMode === mode.value
-                    ? 'border-cyan-400/35 bg-cyan-400/[0.08] text-white'
-                    : 'border-white/10 bg-[#050c18] text-slate-300 hover:border-cyan-400/20'"
-                >
-                  <div class="text-sm font-medium">{{ mode.label }}</div>
-                  <div class="text-[11px] text-slate-400 mt-1">{{ mode.hint }}</div>
-                </button>
-              </div>
-
-              <div
-                v-if="downloadPipelineSplitMode === 'silence' || downloadPipelineSplitMode === 'chapters'"
-                class="grid grid-cols-1 gap-3"
-              >
-                <label class="space-y-2">
-                  <span class="text-xs uppercase tracking-[0.18em] text-slate-400">
-                    {{ downloadPipelineSplitMode === 'chapters' ? 'Fallback threshold (dB)' : 'Threshold (dB)' }}
-                  </span>
-                  <input
-                    v-model.number="downloadPipelineSilence.thresholdDb"
-                    type="number"
-                    step="1"
-                    class="w-full h-11 rounded-2xl border border-white/10 bg-[#050c18] px-4 text-slate-100 focus:outline-none focus:ring-1 focus:ring-cyan-400/50"
-                  />
-                </label>
-
-                <label class="space-y-2">
-                  <span class="text-xs uppercase tracking-[0.18em] text-slate-400">
-                    {{ downloadPipelineSplitMode === 'chapters' ? 'Fallback silence' : 'Minimum silence' }}
-                  </span>
-                  <input
-                    v-model.number="downloadPipelineSilence.minSilenceDuration"
-                    type="number"
-                    min="0.1"
-                    step="0.1"
-                    class="w-full h-11 rounded-2xl border border-white/10 bg-[#050c18] px-4 text-slate-100 focus:outline-none focus:ring-1 focus:ring-cyan-400/50"
-                  />
-                </label>
-
-                <label class="space-y-2">
-                  <span class="text-xs uppercase tracking-[0.18em] text-slate-400">Minimum segment</span>
-                  <input
-                    v-model.number="downloadPipelineSilence.minSegmentDuration"
-                    type="number"
-                    min="1"
-                    step="1"
-                    class="w-full h-11 rounded-2xl border border-white/10 bg-[#050c18] px-4 text-slate-100 focus:outline-none focus:ring-1 focus:ring-cyan-400/50"
-                  />
-                </label>
-              </div>
-
-              <div class="rounded-2xl border border-amber-400/20 bg-amber-400/[0.06] px-3 py-3 text-xs text-amber-100 leading-6">
-                `Trim waveform` and `Manual marks` still require a real local file, so they stay in the `Split / Trim` tab for already downloaded files.
-              </div>
-            </div>
-
             <div class="rounded-[22px] border border-white/10 bg-[#060d18] p-4 space-y-3">
               <p class="text-[11px] uppercase tracking-[0.22em] text-slate-400">Quick Controls</p>
               <div class="grid grid-cols-1 gap-2">
@@ -2493,91 +2547,39 @@ onUnmounted(() => {
               </div>
             </div>
 
-            <div class="rounded-[22px] border border-white/10 bg-[#060d18] p-4 space-y-3">
-              <div class="flex items-center justify-between gap-3">
-                <p class="text-[11px] uppercase tracking-[0.22em] text-slate-400">Process Chain Used By Pipeline</p>
-                <button
-                  @click="activeTab = 'process'"
-                  class="text-xs text-cyan-300 hover:text-cyan-200 transition-colors"
-                >
-                  Open Process
-                </button>
-              </div>
-
-              <div class="overflow-hidden rounded-[18px] border border-white/10 bg-[#050c18]">
-                <table class="w-full table-fixed border-collapse">
-                  <tbody class="divide-y divide-white/10">
-                    <tr v-for="row in downloadPipelineSummaryRows" :key="`download-pipeline-${row.label}`" class="align-top">
-                      <th class="w-[118px] px-3 py-2.5 text-left text-[10px] font-medium uppercase tracking-[0.18em] text-slate-500">
-                        {{ row.label }}
-                      </th>
-                      <td class="px-3 py-2.5">
-                        <div class="text-xs font-medium text-slate-100 break-words">{{ row.value }}</div>
-                        <div v-if="row.detail" class="mt-1 text-[11px] text-slate-400">{{ row.detail }}</div>
-                      </td>
-                    </tr>
-                  </tbody>
-                </table>
-              </div>
-
-              <div class="grid grid-cols-1 gap-2">
-                <button
-                  @click="openOverlay('processOutput')"
-                  class="inline-flex items-center justify-center whitespace-nowrap h-10 px-4 rounded-2xl border border-white/10 bg-[#050c18] text-slate-200 hover:border-cyan-400/20 transition-colors gap-2"
-                >
-                  <Settings2 class="w-4 h-4" />
-                  Edit output chain
-                </button>
-                <button
-                  v-if="isAudioStudio"
-                  @click="openOverlay('processAudio')"
-                  class="inline-flex items-center justify-center whitespace-nowrap h-10 px-4 rounded-2xl border border-white/10 bg-[#050c18] text-slate-200 hover:border-cyan-400/20 transition-colors gap-2"
-                >
-                  <SlidersHorizontal class="w-4 h-4" />
-                  Edit audio chain
-                </button>
-                <button
-                  @click="activeTab = 'split'"
-                  class="inline-flex items-center justify-center whitespace-nowrap h-10 px-4 rounded-2xl border border-white/10 bg-[#050c18] text-slate-200 hover:border-cyan-400/20 transition-colors gap-2"
-                >
-                  <Scissors class="w-4 h-4" />
-                  Open local trim tools
-                </button>
-              </div>
-            </div>
-
-            <div class="rounded-[22px] border border-white/10 bg-[#060d18] p-4 space-y-3">
-              <p class="text-[11px] uppercase tracking-[0.22em] text-slate-400">Workflow</p>
-              <div class="space-y-2">
-                <div class="rounded-2xl border border-white/10 bg-white/[0.03] px-3 py-3">
-                  <p class="text-sm font-medium text-slate-100">Download only</p>
-                  <p class="text-xs text-slate-400 mt-1">Saves the original converted output directly to the selected folder.</p>
-                </div>
-                <div class="rounded-2xl border border-emerald-400/20 bg-emerald-400/[0.06] px-3 py-3">
-                  <p class="text-sm font-medium text-emerald-100">Download then process</p>
-                  <p class="text-xs text-emerald-50/70 mt-1">Uses a temporary internal folder, then renders the final {{ currentProcessModeLabel }} result to {{ currentPipelineDestination }}.</p>
-                </div>
-              </div>
-            </div>
-
             <div class="rounded-[22px] border border-cyan-400/15 bg-cyan-400/[0.04] p-4 space-y-3">
               <p class="text-[11px] uppercase tracking-[0.22em] text-cyan-200/80">Queue Actions</p>
-              <div class="grid grid-cols-1 gap-2">
+
+              <template v-if="downloadStep === 'url'">
+                <button
+                  @click="exploreFormats"
+                  :disabled="!url.trim() || formatListLoading"
+                  class="w-full inline-flex items-center justify-center whitespace-nowrap h-11 px-5 rounded-2xl bg-cyan-400 text-slate-950 font-semibold hover:bg-cyan-300 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  <template v-if="formatListLoading">Exploring formats...</template>
+                  <template v-else>Explore formats</template>
+                </button>
+              </template>
+
+              <template v-else-if="downloadStep === 'formats'">
+                <button
+                  @click="downloadStep = 'confirm'"
+                  :disabled="!selectedFormatId"
+                  class="w-full inline-flex items-center justify-center whitespace-nowrap h-11 px-5 rounded-2xl bg-cyan-400 text-slate-950 font-semibold hover:bg-cyan-300 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  Continue to confirm
+                </button>
+              </template>
+
+              <template v-else-if="downloadStep === 'confirm'">
                 <button
                   @click="addDownloadToQueue"
-                  :disabled="!downloadReady"
-                  class="inline-flex items-center justify-center whitespace-nowrap h-11 px-5 rounded-2xl bg-cyan-400 text-slate-950 font-semibold hover:bg-cyan-300 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                  :disabled="!canConfirmDownload"
+                  class="w-full inline-flex items-center justify-center whitespace-nowrap h-11 px-5 rounded-2xl bg-cyan-400 text-slate-950 font-semibold hover:bg-cyan-300 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
                 >
-                  Download Only
+                  Add to queue
                 </button>
-                <button
-                  @click="addDownloadProcessToQueue"
-                  :disabled="!downloadReady"
-                  class="inline-flex items-center justify-center whitespace-nowrap h-11 px-5 rounded-2xl bg-emerald-400 text-slate-950 font-semibold hover:bg-emerald-300 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-                >
-                  Download & Use This Chain
-                </button>
-              </div>
+              </template>
             </div>
           </aside>
         </section>
@@ -3176,6 +3178,7 @@ onUnmounted(() => {
               :item="item"
               @cancel="cancelItem"
               @reveal="revealQueueOutput"
+              @process="sendToProcess"
             />
           </div>
         </section>
