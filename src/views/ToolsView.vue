@@ -37,14 +37,25 @@ import {
   isActiveStatus,
   isTerminalStatus,
 } from '../composables/useQueue';
-import { addLog as pushLog } from '../stores/logs';
+import {
+  AUDIO_BITRATES,
+  AUDIO_TARGETS,
+  LOUDNESS_PRESETS,
+  PLAYLIST_MODES,
+  SPLIT_MODES,
+  TABS,
+  VIDEO_QUALITIES,
+  useWorkspace,
+  type QueueFilter,
+  type StudioMode,
+  type SummaryRow,
+} from '../composables/useWorkspace';
 import type {
   AudioTarget,
   DownloadJobRequest,
   EqualizerSettings,
   JobRequest,
   JobProgressPayload,
-  MediaKind,
   MediaProbeResponse,
   PlaylistMode,
   ProcessJobRequest,
@@ -58,69 +69,28 @@ import type {
   YtdlpFormatsResponse,
 } from '../types/jobs';
 
-type WorkspaceTab = 'downloads' | 'process' | 'split' | 'queue';
-type QueueFilter = 'studio' | 'all';
 type TrimHandle = 'start' | 'end';
-type SummaryRow = { label: string; value: string; detail?: string };
-type OverlayPanel =
-  | 'downloadOptions'
-  | 'downloadAccess'
-  | 'processOutput'
-  | 'processAudio'
-  | 'trimTools';
 
 const DOWNLOAD_CONCURRENT_LIMIT = 2;
 const PROCESS_CONCURRENT_LIMIT = 2;
 const QUEUE_STORAGE_KEY = 'mediatoolspro.queue.v1';
 const LEGACY_QUEUE_STORAGE_KEY = 'audiotoolspro.queue.v1';
-const AUDIO_BITRATES = ['320', '256', '192', '128'];
-const VIDEO_QUALITIES = ['2160', '1080', '720', '480'];
 const MIN_TRIM_GAP_SECONDS = 0.1;
-const TABS: Array<{ value: WorkspaceTab; label: string; hint: string }> = [
-  { value: 'downloads', label: 'Downloads', hint: 'URL, playlist, cookies' },
-  { value: 'process', label: 'Process', hint: 'Export, normalize, EQ' },
-  { value: 'split', label: 'Split / Trim', hint: 'Waveform, marks, silence' },
-  { value: 'queue', label: 'Queue', hint: 'Track every job' },
-];
 
-const AUDIO_TARGETS: Array<{ value: AudioTarget; label: string; hint: string }> = [
-  { value: 'general', label: 'General audio', hint: 'Normal download and export behavior.' },
-  {
-    value: 'azuracast',
-    label: 'AzuraCast Ready',
-    hint: 'MP3, 320 kbps, 44.1 kHz stereo and offline loudness prep.',
-  },
-];
-
-const LOUDNESS_PRESETS = [
-  { value: -14, label: 'Streaming loud' },
-  { value: -16, label: 'Podcast / web' },
-  { value: -18, label: 'Broadcast light' },
-  { value: -23, label: 'EBU R128' },
-];
-
-const PLAYLIST_MODES: Array<{ value: PlaylistMode; label: string; hint: string }> = [
-  { value: 'auto', label: 'Auto detect', hint: 'Use the full playlist when the URL includes one.' },
-  { value: 'playlist', label: 'Full playlist', hint: 'Force every item in the playlist to download.' },
-  { value: 'single', label: 'Single item', hint: 'Ignore playlist context and fetch only one item.' },
-];
-
-const SPLIT_MODES: Array<{ value: SplitMode; label: string; hint: string }> = [
-  { value: 'none', label: 'Trim only', hint: 'Keep one output and only trim it.' },
-  { value: 'silence', label: 'Auto split', hint: 'Cut long mixes by silence detection.' },
-  {
-    value: 'chapters',
-    label: 'Source chapters',
-    hint: 'Use embedded YouTube chapters, falling back to silence.',
-  },
-  { value: 'manual', label: 'Manual marks', hint: 'Use your own cut points on the timeline.' },
-];
-
-type StudioMode = MediaKind;
-
-const activeTab = ref<WorkspaceTab>('downloads');
-const studioMode = ref<StudioMode>('audio');
-const systemDownloadDir = ref('Downloads');
+const {
+  activeTab,
+  studioMode,
+  systemDownloadDir,
+  activeOverlay,
+  isAudioStudio,
+  addLog,
+  generateId,
+  formatBytes,
+  basename,
+  dirname,
+  openOverlay,
+  closeOverlay,
+} = useWorkspace();
 
 const url = ref('');
 const format = ref('mp3');
@@ -165,7 +135,6 @@ const audioPreviewElement = ref<HTMLAudioElement | null>(null);
 const activeTrimHandle = ref<TrimHandle | null>(null);
 const isPreviewPlaying = ref(false);
 const loopSelection = ref(false);
-const activeOverlay = ref<OverlayPanel | null>(null);
 const queueFilter = ref<QueueFilter>('studio');
 
 const queue = ref<QueueItemData[]>([]);
@@ -183,7 +152,6 @@ let waveformRequestToken = 0;
 let stopPointerTracking: (() => void) | null = null;
 let queuePersistenceTimer: number | null = null;
 
-const isAudioStudio = computed(() => studioMode.value === 'audio');
 const activeDownloadFormats = computed(() => (isAudioStudio.value ? AUDIO_FORMATS : VIDEO_FORMATS));
 const activeBatchFormats = computed(() => (isAudioStudio.value ? AUDIO_FORMATS : VIDEO_FORMATS));
 const isAudioDownload = computed(() => isAudioStudio.value && AUDIO_FORMATS.includes(format.value));
@@ -467,28 +435,6 @@ const splitSummaryRows = computed<SummaryRow[]>(() => {
 
   return rows;
 });
-const generateId = () => `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
-
-function formatBytes(bytes: number) {
-  if (!bytes || bytes === 0) return 'Unknown size';
-  const sizes = ['B', 'KB', 'MB', 'GB'];
-  const i = Math.floor(Math.log(bytes) / Math.log(1024));
-  return `${(bytes / Math.pow(1024, i)).toFixed(2)} ${sizes[i]}`;
-}
-
-const addLog = (
-  message: string,
-  level: 'info' | 'warn' | 'error' | 'success' = 'info',
-  scope: 'audio' | 'video' | 'system' = studioMode.value,
-) => pushLog(message, level, scope);
-
-const basename = (value: string) => value.split(/[/\\]/).pop() || value;
-const dirname = (value: string) => {
-  const normalized = value.replace(/\\/g, '/');
-  const segments = normalized.split('/');
-  segments.pop();
-  return segments.join('/') || '';
-};
 
 function collectSettings(): PersistedStudioSettings {
   return {
@@ -1787,14 +1733,6 @@ function beginTrimDrag(handle: TrimHandle, event: PointerEvent) {
 
 function setTrimFromCursor(handle: TrimHandle) {
   setTrimBoundary(handle, timelineCursor.value);
-}
-
-function openOverlay(panel: OverlayPanel) {
-  activeOverlay.value = panel;
-}
-
-function closeOverlay() {
-  activeOverlay.value = null;
 }
 
 function addMarkerAtCursor() {
