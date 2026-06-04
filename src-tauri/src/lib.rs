@@ -109,6 +109,7 @@ pub fn run() {
             binaries::delete_ytdlp,
             binaries::delete_ffmpeg,
             binaries::check_binary_updates,
+            binaries::auto_update_ytdlp,
             jobs::cancel_job,
             ytdlp::list_formats,
             ytdlp::start_download,

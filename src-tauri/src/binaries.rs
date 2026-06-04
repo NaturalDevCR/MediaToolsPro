@@ -43,6 +43,7 @@ pub struct BinaryProgress {
 struct VersionCache {
     ytdlp_version: Option<String>,
     ffmpeg_version: Option<String>,
+    last_checked_unix: Option<u64>,
 }
 
 fn get_bin_dir<R: Runtime>(app: &AppHandle<R>) -> PathBuf {
@@ -104,6 +105,20 @@ fn current_os() -> &'static str {
     } else {
         "linux"
     }
+}
+
+pub fn should_check_updates(last_checked: Option<u64>, now: u64, interval_secs: u64) -> bool {
+    match last_checked {
+        None => true,
+        Some(checked_at) => now.saturating_sub(checked_at) >= interval_secs,
+    }
+}
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
 }
 
 fn cache_path(bin_dir: &PathBuf) -> PathBuf {
@@ -205,6 +220,93 @@ async fn fetch_ytdlp_latest_version() -> Option<String> {
         .ok()?;
     let json: serde_json::Value = resp.json().await.ok()?;
     json["tag_name"].as_str().map(|s| s.to_string())
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct AutoUpdateResult {
+    pub checked: bool,
+    pub updated: bool,
+    pub new_version: Option<String>,
+}
+
+#[tauri::command]
+pub async fn auto_update_ytdlp<R: Runtime>(
+    app: AppHandle<R>,
+    force: bool,
+) -> Result<AutoUpdateResult, String> {
+    let bin_dir = get_bin_dir(&app);
+    let mut cache = read_cache(&bin_dir);
+    let ytdlp_path = bin_dir.join(get_ytdlp_name());
+
+    if !ytdlp_path.exists() {
+        return Ok(AutoUpdateResult {
+            checked: false,
+            updated: false,
+            new_version: None,
+        });
+    }
+
+    if !force && !should_check_updates(cache.last_checked_unix, now_unix(), 86_400) {
+        return Ok(AutoUpdateResult {
+            checked: false,
+            updated: false,
+            new_version: None,
+        });
+    }
+
+    let latest = match fetch_ytdlp_latest_version().await {
+        Some(version) => version,
+        None => {
+            return Ok(AutoUpdateResult {
+                checked: false,
+                updated: false,
+                new_version: None,
+            });
+        }
+    };
+
+    cache.last_checked_unix = Some(now_unix());
+    write_cache(&bin_dir, &cache);
+
+    let current = cache.ytdlp_version.clone();
+    let is_newer = match (
+        current.as_deref().and_then(parse_numeric_version),
+        parse_numeric_version(&latest),
+    ) {
+        (Some(current), Some(latest)) => {
+            compare_versions(&latest, &current) == std::cmp::Ordering::Greater
+        }
+        _ => current.as_deref() != Some(latest.as_str()),
+    };
+
+    if !is_newer {
+        return Ok(AutoUpdateResult {
+            checked: true,
+            updated: false,
+            new_version: None,
+        });
+    }
+
+    let url = ytdlp_download_url(current_os(), "stable");
+    download_file(&app, url, &ytdlp_path, "yt-dlp").await?;
+
+    #[cfg(unix)]
+    {
+        let mut perms = fs::metadata(&ytdlp_path)
+            .map_err(|e| e.to_string())?
+            .permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&ytdlp_path, perms).map_err(|e| e.to_string())?;
+    }
+
+    cache_single(&bin_dir, get_ytdlp_name());
+
+    Ok(AutoUpdateResult {
+        checked: true,
+        updated: true,
+        new_version: Some(latest),
+    })
 }
 
 #[tauri::command]
@@ -461,5 +563,12 @@ mod tests {
         assert!(ytdlp_download_url("macos", "stable").contains("yt-dlp/releases"));
         assert!(ytdlp_download_url("macos", "nightly").contains("yt-dlp-nightly-builds"));
         assert!(ytdlp_download_url("windows", "stable").ends_with("yt-dlp.exe"));
+    }
+
+    #[test]
+    fn should_check_respects_interval() {
+        assert!(should_check_updates(None, 1000, 86_400));
+        assert!(!should_check_updates(Some(1000), 1500, 86_400));
+        assert!(should_check_updates(Some(0), 90_000, 86_400));
     }
 }
