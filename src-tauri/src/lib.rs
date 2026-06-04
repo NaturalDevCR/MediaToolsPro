@@ -3,12 +3,6 @@ use std::process::Command;
 use std::{fs, path::PathBuf};
 use tauri::{Manager, Runtime};
 
-// Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-#[tauri::command]
-fn greet(name: &str) -> String {
-    format!("Hello, {}! You've been greeted from Rust!", name)
-}
-
 #[tauri::command]
 fn reveal_path(path: String) -> Result<(), String> {
     let target = Path::new(&path);
@@ -98,7 +92,6 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .manage(jobs::JobState::new())
         .invoke_handler(tauri::generate_handler![
-            greet,
             reveal_path,
             prepare_pipeline_temp_dir,
             cleanup_pipeline_temp_dir,
