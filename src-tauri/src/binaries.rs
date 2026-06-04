@@ -1,11 +1,12 @@
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::Write;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
-use tauri::{AppHandle, Manager, Runtime};
+use tauri::{AppHandle, Emitter, Manager, Runtime};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct BinaryStatus {
@@ -27,6 +28,15 @@ pub struct BinaryUpdateStatus {
     pub ytdlp_latest_version: Option<String>,
     pub ffmpeg_update_available: bool,
     pub ffmpeg_latest_version: Option<String>,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct BinaryProgress {
+    pub binary: String,
+    pub downloaded: u64,
+    pub total: Option<u64>,
+    pub percent: f64,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -60,6 +70,39 @@ fn get_ffmpeg_name() -> &'static str {
         "ffmpeg.exe"
     } else {
         "ffmpeg"
+    }
+}
+
+pub fn part_path(path: &Path) -> PathBuf {
+    let mut value = path.as_os_str().to_owned();
+    value.push(".part");
+    PathBuf::from(value)
+}
+
+pub fn ytdlp_download_url(os: &str, channel: &str) -> &'static str {
+    match (os, channel) {
+        ("windows", "nightly") => {
+            "https://github.com/yt-dlp/yt-dlp-nightly-builds/releases/latest/download/yt-dlp.exe"
+        }
+        ("macos", "nightly") => {
+            "https://github.com/yt-dlp/yt-dlp-nightly-builds/releases/latest/download/yt-dlp_macos"
+        }
+        (_, "nightly") => {
+            "https://github.com/yt-dlp/yt-dlp-nightly-builds/releases/latest/download/yt-dlp"
+        }
+        ("windows", _) => "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe",
+        ("macos", _) => "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_macos",
+        (_, _) => "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp",
+    }
+}
+
+fn current_os() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "windows"
+    } else if cfg!(target_os = "macos") {
+        "macos"
+    } else {
+        "linux"
     }
 }
 
@@ -252,15 +295,8 @@ pub async fn install_ytdlp<R: Runtime>(app: AppHandle<R>) -> Result<(), String> 
     let bin_dir = get_bin_dir(&app);
     let target = bin_dir.join(get_ytdlp_name());
 
-    let url = if cfg!(target_os = "windows") {
-        "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe"
-    } else if cfg!(target_os = "macos") {
-        "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_macos"
-    } else {
-        "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp"
-    };
-
-    download_file(url, &target).await?;
+    let url = ytdlp_download_url(current_os(), "stable");
+    download_file(&app, url, &target, "yt-dlp").await?;
 
     #[cfg(unix)]
     {
@@ -297,7 +333,7 @@ pub async fn install_ffmpeg<R: Runtime>(app: AppHandle<R>) -> Result<(), String>
 
     if is_zip {
         let tmp_zip = bin_dir.join("ffmpeg.zip");
-        download_file(url, &tmp_zip).await?;
+        download_file(&app, url, &tmp_zip, "ffmpeg").await?;
 
         let file = fs::File::open(&tmp_zip).map_err(|e| e.to_string())?;
         let mut archive = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
@@ -331,11 +367,59 @@ pub async fn install_ffmpeg<R: Runtime>(app: AppHandle<R>) -> Result<(), String>
     Ok(())
 }
 
-async fn download_file(url: &str, path: &PathBuf) -> Result<(), String> {
-    let response = reqwest::get(url).await.map_err(|e| e.to_string())?;
-    let bytes = response.bytes().await.map_err(|e| e.to_string())?;
-    let mut file = fs::File::create(path).map_err(|e| e.to_string())?;
-    file.write_all(&bytes).map_err(|e| e.to_string())?;
+async fn download_file<R: Runtime>(
+    app: &AppHandle<R>,
+    url: &str,
+    path: &PathBuf,
+    label: &str,
+) -> Result<(), String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(600))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let response = client
+        .get(url)
+        .header("User-Agent", "MediaToolsPro")
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "Download failed for {} (HTTP {})",
+            label,
+            response.status().as_u16()
+        ));
+    }
+
+    let total = response.content_length();
+    let part = part_path(path);
+    let mut file = fs::File::create(&part).map_err(|e| e.to_string())?;
+    let mut downloaded = 0_u64;
+    let mut stream = response.bytes_stream();
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| e.to_string())?;
+        file.write_all(&chunk).map_err(|e| e.to_string())?;
+        downloaded += chunk.len() as u64;
+        let percent = total
+            .map(|t| (downloaded as f64 / t as f64) * 100.0)
+            .unwrap_or(0.0);
+        let _ = app.emit(
+            "binary-progress",
+            BinaryProgress {
+                binary: label.to_string(),
+                downloaded,
+                total,
+                percent,
+            },
+        );
+    }
+
+    drop(file);
+    if path.exists() {
+        fs::remove_file(path).map_err(|e| e.to_string())?;
+    }
+    fs::rename(&part, path).map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -359,4 +443,23 @@ pub async fn delete_ffmpeg<R: Runtime>(app: AppHandle<R>) -> Result<(), String> 
     }
     clear_cached(&bin_dir, get_ffmpeg_name());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn part_path_appends_suffix() {
+        let p = part_path(Path::new("/bin/yt-dlp"));
+        assert_eq!(p.to_string_lossy(), "/bin/yt-dlp.part");
+    }
+
+    #[test]
+    fn url_selects_channel_and_os() {
+        assert!(ytdlp_download_url("macos", "stable").contains("yt-dlp/releases"));
+        assert!(ytdlp_download_url("macos", "nightly").contains("yt-dlp-nightly-builds"));
+        assert!(ytdlp_download_url("windows", "stable").ends_with("yt-dlp.exe"));
+    }
 }
