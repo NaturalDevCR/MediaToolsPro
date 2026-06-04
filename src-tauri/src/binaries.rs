@@ -26,6 +26,7 @@ pub struct BinaryVersions {
 pub struct BinaryUpdateStatus {
     pub ytdlp_update_available: bool,
     pub ytdlp_latest_version: Option<String>,
+    /// ffmpeg static builds do not have an app-managed update channel yet.
     pub ffmpeg_update_available: bool,
     pub ffmpeg_latest_version: Option<String>,
 }
@@ -393,11 +394,15 @@ pub async fn check_binary_updates<R: Runtime>(app: AppHandle<R>) -> Result<Binar
 }
 
 #[tauri::command]
-pub async fn install_ytdlp<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
+pub async fn install_ytdlp<R: Runtime>(
+    app: AppHandle<R>,
+    channel: Option<String>,
+) -> Result<(), String> {
     let bin_dir = get_bin_dir(&app);
     let target = bin_dir.join(get_ytdlp_name());
 
-    let url = ytdlp_download_url(current_os(), "stable");
+    let channel = channel.as_deref().unwrap_or("stable");
+    let url = ytdlp_download_url(current_os(), channel);
     download_file(&app, url, &target, "yt-dlp").await?;
 
     #[cfg(unix)]
