@@ -18,6 +18,19 @@ import {
   Youtube,
 } from 'lucide-vue-next';
 import QueueItem from '../components/QueueItem.vue';
+import {
+  AUDIO_FORMATS,
+  DEFAULT_SILENCE,
+  LEGACY_SETTINGS_STORAGE_KEY,
+  SETTINGS_STORAGE_KEY,
+  VIDEO_FORMATS,
+  restorePersistedSettings,
+  sanitizeSettings,
+  savePersistedSettings,
+  type BatchDestinationMode,
+  type DownloadDestinationMode,
+  type PersistedStudioSettings,
+} from '../composables/useSettings';
 import { addLog as pushLog } from '../stores/logs';
 import type {
   AudioTarget,
@@ -41,8 +54,6 @@ import type {
 
 type WorkspaceTab = 'downloads' | 'process' | 'split' | 'queue';
 type QueueFilter = 'studio' | 'all';
-type DownloadDestinationMode = 'downloads' | 'custom';
-type BatchDestinationMode = 'source' | 'custom';
 type TrimHandle = 'start' | 'end';
 type SummaryRow = { label: string; value: string; detail?: string };
 type OverlayPanel =
@@ -55,11 +66,7 @@ type OverlayPanel =
 const DOWNLOAD_CONCURRENT_LIMIT = 2;
 const PROCESS_CONCURRENT_LIMIT = 2;
 const QUEUE_STORAGE_KEY = 'mediatoolspro.queue.v1';
-const SETTINGS_STORAGE_KEY = 'mediatoolspro.settings.v1';
 const LEGACY_QUEUE_STORAGE_KEY = 'audiotoolspro.queue.v1';
-const LEGACY_SETTINGS_STORAGE_KEY = 'audiotoolspro.settings.v1';
-const AUDIO_FORMATS = ['mp3', 'flac', 'ogg', 'wav', 'm4a', 'aac'];
-const VIDEO_FORMATS = ['mp4', 'webm', 'mkv'];
 const AUDIO_BITRATES = ['320', '256', '192', '128'];
 const VIDEO_QUALITIES = ['2160', '1080', '720', '480'];
 const MIN_TRIM_GAP_SECONDS = 0.1;
@@ -103,33 +110,7 @@ const SPLIT_MODES: Array<{ value: SplitMode; label: string; hint: string }> = [
   { value: 'manual', label: 'Manual marks', hint: 'Use your own cut points on the timeline.' },
 ];
 
-const DEFAULT_SILENCE: SilenceSplitSettings = {
-  thresholdDb: -35,
-  minSilenceDuration: 1.5,
-  minSegmentDuration: 20,
-};
-
 type StudioMode = MediaKind;
-type PersistedStudioSettings = {
-  format: string;
-  quality: string;
-  playlistMode: PlaylistMode;
-  downloadAudioTarget: AudioTarget;
-  downloadVideoTarget: VideoTarget;
-  downloadDestinationMode: DownloadDestinationMode;
-  downloadPath: string;
-  batchDestinationMode: BatchDestinationMode;
-  batchOutputDir: string;
-  batchFormat: string;
-  normalizeAudio: boolean;
-  loudnessTargetLufs: number;
-  batchAudioTarget: AudioTarget;
-  eq: EqualizerSettings;
-  fadeInDuration: number;
-  fadeOutDuration: number;
-  downloadPipelineSplitMode: SplitMode;
-  downloadPipelineSilence: SilenceSplitSettings;
-};
 
 const activeTab = ref<WorkspaceTab>('downloads');
 const studioMode = ref<StudioMode>('audio');
@@ -511,14 +492,6 @@ const dirname = (value: string) => {
 const isActiveStatus = (status: QueueStatus) =>
   ['downloading', 'processing', 'converting'].includes(status);
 
-function settingsKeyForMode(mode: StudioMode) {
-  return `${SETTINGS_STORAGE_KEY}.${mode}`;
-}
-
-function legacySettingsKeyForMode(mode: StudioMode) {
-  return `${LEGACY_SETTINGS_STORAGE_KEY}.${mode}`;
-}
-
 function collectSettings(): PersistedStudioSettings {
   return {
     format: format.value,
@@ -542,120 +515,41 @@ function collectSettings(): PersistedStudioSettings {
   };
 }
 
-function defaultSettingsForMode(mode: StudioMode): PersistedStudioSettings {
-  return {
-    format: mode === 'audio' ? 'mp3' : 'mp4',
-    quality: mode === 'audio' ? 'best' : '1080',
-    playlistMode: 'auto',
-    downloadAudioTarget: 'general',
-    downloadVideoTarget: 'general',
-    downloadDestinationMode: 'downloads',
-    downloadPath: '',
-    batchDestinationMode: 'source',
-    batchOutputDir: '',
-    batchFormat: mode === 'audio' ? 'mp3' : 'mp4',
-    normalizeAudio: mode === 'audio',
-    loudnessTargetLufs: -16,
-    batchAudioTarget: 'general',
-    eq: { bass: 0, mid: 0, treble: 0 },
-    fadeInDuration: 0,
-    fadeOutDuration: 0,
-    downloadPipelineSplitMode: 'none',
-    downloadPipelineSilence: { ...DEFAULT_SILENCE },
-  };
-}
-
 function persistSettings(mode: StudioMode = studioMode.value) {
   const settings = collectSettings();
   try {
-    window.localStorage.setItem(settingsKeyForMode(mode), JSON.stringify(settings));
-    window.localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify({ activeMode: studioMode.value }));
+    savePersistedSettings(mode, settings, studioMode.value);
   } catch (error) {
     addLog(`Failed to save settings: ${String(error)}`, 'error');
   }
 }
 
 function applySettings(settings: Record<string, unknown>, mode: StudioMode) {
-  const fallback = defaultSettingsForMode(mode);
+  const next = sanitizeSettings(settings, mode);
 
-  format.value =
-    typeof settings.format === 'string' && (mode === 'audio' ? AUDIO_FORMATS : VIDEO_FORMATS).includes(settings.format)
-      ? settings.format
-      : fallback.format;
-  quality.value = typeof settings.quality === 'string' ? settings.quality : fallback.quality;
-
-  playlistMode.value =
-    settings.playlistMode === 'auto' || settings.playlistMode === 'playlist' || settings.playlistMode === 'single'
-      ? settings.playlistMode
-      : fallback.playlistMode;
-
-  downloadAudioTarget.value =
-    settings.downloadAudioTarget === 'azuracast' ? 'azuracast' : fallback.downloadAudioTarget;
-  downloadVideoTarget.value =
-    settings.downloadVideoTarget === 'google_tv_cast' ? 'google_tv_cast' : fallback.downloadVideoTarget;
-  downloadDestinationMode.value =
-    settings.downloadDestinationMode === 'custom' ? 'custom' : fallback.downloadDestinationMode;
-  downloadPath.value = typeof settings.downloadPath === 'string' ? settings.downloadPath : fallback.downloadPath;
-  batchDestinationMode.value =
-    settings.batchDestinationMode === 'custom' ? 'custom' : fallback.batchDestinationMode;
-  batchOutputDir.value =
-    typeof settings.batchOutputDir === 'string' ? settings.batchOutputDir : fallback.batchOutputDir;
-  batchFormat.value =
-    typeof settings.batchFormat === 'string' && (mode === 'audio' ? AUDIO_FORMATS : VIDEO_FORMATS).includes(settings.batchFormat)
-      ? settings.batchFormat
-      : fallback.batchFormat;
-  normalizeAudio.value =
-    typeof settings.normalizeAudio === 'boolean' ? settings.normalizeAudio : fallback.normalizeAudio;
-  loudnessTargetLufs.value =
-    typeof settings.loudnessTargetLufs === 'number'
-      ? clamp(settings.loudnessTargetLufs, -30, -6)
-      : fallback.loudnessTargetLufs;
-  batchAudioTarget.value = settings.batchAudioTarget === 'azuracast' ? 'azuracast' : fallback.batchAudioTarget;
-
-  const rawEq = settings.eq as Record<string, unknown> | undefined;
-  eq.value = {
-    bass: typeof rawEq?.bass === 'number' ? rawEq.bass : fallback.eq.bass,
-    mid: typeof rawEq?.mid === 'number' ? rawEq.mid : fallback.eq.mid,
-    treble: typeof rawEq?.treble === 'number' ? rawEq.treble : fallback.eq.treble,
-  };
-  fadeInDuration.value =
-    typeof settings.fadeInDuration === 'number' ? Math.max(0, settings.fadeInDuration) : fallback.fadeInDuration;
-  fadeOutDuration.value =
-    typeof settings.fadeOutDuration === 'number' ? Math.max(0, settings.fadeOutDuration) : fallback.fadeOutDuration;
-  downloadPipelineSplitMode.value =
-    settings.downloadPipelineSplitMode === 'silence' ||
-    settings.downloadPipelineSplitMode === 'chapters'
-      ? settings.downloadPipelineSplitMode
-      : fallback.downloadPipelineSplitMode;
-  const rawPipelineSilence = settings.downloadPipelineSilence as Record<string, unknown> | undefined;
-  downloadPipelineSilence.value = {
-    thresholdDb:
-      typeof rawPipelineSilence?.thresholdDb === 'number'
-        ? rawPipelineSilence.thresholdDb
-        : fallback.downloadPipelineSilence.thresholdDb,
-    minSilenceDuration:
-      typeof rawPipelineSilence?.minSilenceDuration === 'number'
-        ? rawPipelineSilence.minSilenceDuration
-        : fallback.downloadPipelineSilence.minSilenceDuration,
-    minSegmentDuration:
-      typeof rawPipelineSilence?.minSegmentDuration === 'number'
-        ? rawPipelineSilence.minSegmentDuration
-        : fallback.downloadPipelineSilence.minSegmentDuration,
-  };
+  format.value = next.format;
+  quality.value = next.quality;
+  playlistMode.value = next.playlistMode;
+  downloadAudioTarget.value = next.downloadAudioTarget;
+  downloadVideoTarget.value = next.downloadVideoTarget;
+  downloadDestinationMode.value = next.downloadDestinationMode;
+  downloadPath.value = next.downloadPath;
+  batchDestinationMode.value = next.batchDestinationMode;
+  batchOutputDir.value = next.batchOutputDir;
+  batchFormat.value = next.batchFormat;
+  normalizeAudio.value = next.normalizeAudio;
+  loudnessTargetLufs.value = next.loudnessTargetLufs;
+  batchAudioTarget.value = next.batchAudioTarget;
+  eq.value = next.eq;
+  fadeInDuration.value = next.fadeInDuration;
+  fadeOutDuration.value = next.fadeOutDuration;
+  downloadPipelineSplitMode.value = next.downloadPipelineSplitMode;
+  downloadPipelineSilence.value = next.downloadPipelineSilence;
 }
 
 function restoreSettings(mode: StudioMode = studioMode.value) {
   try {
-    const raw =
-      window.localStorage.getItem(settingsKeyForMode(mode)) ??
-      window.localStorage.getItem(legacySettingsKeyForMode(mode));
-    if (!raw) {
-      applySettings(defaultSettingsForMode(mode), mode);
-      return;
-    }
-
-    const settings = JSON.parse(raw) as Record<string, unknown>;
-    applySettings(settings, mode);
+    applySettings(restorePersistedSettings(mode), mode);
   } catch (error) {
     addLog(`Failed to restore settings: ${String(error)}`, 'error');
   }
