@@ -36,7 +36,11 @@ pub struct DownloadRequest {
     pub format_has_audio: Option<bool>,
     pub output_path: String,
     pub playlist_mode: Option<String>,
+    // Sent by the frontend as part of the request shape but not consumed by the
+    // download path itself (they inform processing targets elsewhere).
+    #[allow(dead_code)]
     pub audio_target: Option<String>,
+    #[allow(dead_code)]
     pub video_target: Option<String>,
     pub cookies_file: Option<String>,
     pub recode: Option<bool>,
