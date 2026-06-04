@@ -421,9 +421,11 @@ pub async fn start_download<R: Runtime>(
                         eta: "-".into(),
                         total_size: "-".into(),
                         title: Some(url.clone()),
-                        detail: Some(error.clone()),
+                        // Normalize to a friendly, actionable message only here, at the
+                        // UI boundary. The raw error already drove the retry predicates.
+                        detail: Some(normalize_error(&error, request.cookies_file.is_some())),
                         output_path: None,
-                        error: Some(error.clone()),
+                        error: Some(normalize_error(&error, request.cookies_file.is_some())),
                     },
                 );
                 emit_log(
@@ -661,7 +663,10 @@ async fn run_download_process<R: Runtime>(
             .find(|line| !line.trim().is_empty())
             .cloned()
             .unwrap_or_else(|| "yt-dlp exited with an error".into());
-        Err(normalize_error(&stderr_excerpt, has_cookies))
+        // Return the RAW yt-dlp error. The retry predicates in `start_download`
+        // (should_try_next_client / looks_like_public_video_failure) match on the
+        // unmodified keywords; normalization happens only at the UI emit boundary.
+        Err(stderr_excerpt)
     }
 }
 
