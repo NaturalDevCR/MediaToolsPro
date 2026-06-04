@@ -17,7 +17,7 @@ import {
   X,
   Youtube,
 } from 'lucide-vue-next';
-import QueueItem from '../components/QueueItem.vue';
+import QueuePanel from '../components/queue/QueuePanel.vue';
 import {
   AUDIO_FORMATS,
   DEFAULT_SILENCE,
@@ -2926,59 +2926,16 @@ onUnmounted(() => {
       </template>
 
       <template v-else-if="activeTab === 'queue'">
-        <section class="rounded-[30px] border border-white/10 bg-[#091626] p-6">
-          <div class="flex items-center justify-between gap-4 mb-5">
-            <div>
-              <p class="text-xs uppercase tracking-[0.22em] text-cyan-400/80 font-semibold">Queue</p>
-              <h2 class="text-3xl font-semibold text-slate-50 mt-2">Downloads, processing and pipelines</h2>
-            </div>
-            <div class="flex items-center gap-3">
-              <div class="flex rounded-2xl border border-white/10 bg-white/[0.03] p-1">
-                <button
-                  @click="queueFilter = 'studio'"
-                  class="px-3 py-1.5 rounded-xl text-xs font-semibold transition-colors"
-                  :class="queueFilter === 'studio' ? 'bg-cyan-400 text-slate-950' : 'text-slate-300 hover:bg-white/[0.05]'"
-                >
-                  Current Studio
-                </button>
-                <button
-                  @click="queueFilter = 'all'"
-                  class="px-3 py-1.5 rounded-xl text-xs font-semibold transition-colors"
-                  :class="queueFilter === 'all' ? 'bg-cyan-400 text-slate-950' : 'text-slate-300 hover:bg-white/[0.05]'"
-                >
-                  All Jobs
-                </button>
-              </div>
-              <div class="text-sm text-slate-400">
-                {{ visibleQueueItems.length }} item{{ visibleQueueItems.length === 1 ? '' : 's' }}
-              </div>
-              <button
-                v-if="queueHistoryCount > 0"
-                @click="clearQueueHistory"
-                class="inline-flex items-center justify-center whitespace-nowrap h-10 px-4 rounded-2xl border border-white/10 bg-[#060d18] text-slate-200 hover:border-cyan-400/25 transition-colors"
-              >
-                Clear history
-              </button>
-            </div>
-          </div>
-
-          <div v-if="visibleQueueItems.length === 0" class="py-20 flex flex-col items-center justify-center text-slate-500">
-            <FolderOpen class="w-16 h-16 mb-4 opacity-50" />
-            <p class="text-lg font-light text-slate-300">No jobs in this view</p>
-            <p class="text-sm opacity-70">Switch the filter or add a download, pipeline, or processing job from the other tabs.</p>
-          </div>
-
-          <div v-else class="space-y-3">
-            <QueueItem
-              v-for="item in visibleQueueItems"
-              :key="item.id"
-              :item="item"
-              @cancel="cancelItem"
-              @reveal="revealQueueOutput"
-              @process="sendToProcess"
-            />
-          </div>
-        </section>
+        <QueuePanel
+          :items="visibleQueueItems"
+          :history-count="queueHistoryCount"
+          :filter="queueFilter"
+          @update:filter="queueFilter = $event"
+          @cancel="cancelItem"
+          @reveal="revealQueueOutput"
+          @process="sendToProcess"
+          @clear-history="clearQueueHistory"
+        />
       </template>
 
       <template v-else>
