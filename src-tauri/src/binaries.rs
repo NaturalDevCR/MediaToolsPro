@@ -500,7 +500,29 @@ async fn download_file<R: Runtime>(
 
     let total = response.content_length();
     let part = part_path(path);
-    let mut file = fs::File::create(&part).map_err(|e| e.to_string())?;
+
+    // Stream into a sibling .part file, then atomically publish. Any mid-stream
+    // failure removes the partial file so we never leave a corrupt artifact behind.
+    if let Err(error) = stream_to_part(app, response, &part, label, total).await {
+        let _ = fs::remove_file(&part);
+        return Err(error);
+    }
+
+    if path.exists() {
+        fs::remove_file(path).map_err(|e| e.to_string())?;
+    }
+    fs::rename(&part, path).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+async fn stream_to_part<R: Runtime>(
+    app: &AppHandle<R>,
+    response: reqwest::Response,
+    part: &Path,
+    label: &str,
+    total: Option<u64>,
+) -> Result<(), String> {
+    let mut file = fs::File::create(part).map_err(|e| e.to_string())?;
     let mut downloaded = 0_u64;
     let mut stream = response.bytes_stream();
 
@@ -522,11 +544,6 @@ async fn download_file<R: Runtime>(
         );
     }
 
-    drop(file);
-    if path.exists() {
-        fs::remove_file(path).map_err(|e| e.to_string())?;
-    }
-    fs::rename(&part, path).map_err(|e| e.to_string())?;
     Ok(())
 }
 
