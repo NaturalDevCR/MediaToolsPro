@@ -14,6 +14,11 @@ use tauri::{AppHandle, Manager, Runtime, State};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 
+mod args;
+mod clients;
+mod errors;
+mod progress;
+
 #[derive(Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct DownloadRequest {
