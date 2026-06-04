@@ -31,6 +31,12 @@ import {
   type DownloadDestinationMode,
   type PersistedStudioSettings,
 } from '../composables/useSettings';
+import {
+  applyJobProgress,
+  getQueueStats,
+  isActiveStatus,
+  isTerminalStatus,
+} from '../composables/useQueue';
 import { addLog as pushLog } from '../stores/logs';
 import type {
   AudioTarget,
@@ -279,12 +285,7 @@ const canQueueBatch = computed(() => {
   return true;
 });
 const hasSavedCookiesFile = computed(() => Boolean(cookiesFile.value.trim()));
-const isTerminalStatus = (status: QueueStatus) => ['done', 'error', 'cancelled'].includes(status);
-const queueStats = computed(() => {
-  const active = queue.value.filter((item) => isActiveStatus(item.status)).length;
-  const waiting = queue.value.filter((item) => item.status === 'waiting').length;
-  return { total: queue.value.length, active, waiting };
-});
+const queueStats = computed(() => getQueueStats(queue.value));
 const visibleQueueItems = computed(() =>
   queueFilter.value === 'all'
     ? queue.value
@@ -488,9 +489,6 @@ const dirname = (value: string) => {
   segments.pop();
   return segments.join('/') || '';
 };
-
-const isActiveStatus = (status: QueueStatus) =>
-  ['downloading', 'processing', 'converting'].includes(status);
 
 function collectSettings(): PersistedStudioSettings {
   return {
@@ -1461,30 +1459,7 @@ function updateQueueItem(payload: JobProgressPayload) {
   }
 
   const previousStatus = item.status;
-
-  item.kind = payload.jobKind;
-  item.mediaKind = payload.mediaKind;
-  item.status = payload.status;
-  item.percent = payload.percent;
-  item.speed = payload.speed;
-  item.eta = payload.eta;
-  item.totalSize = payload.totalSize;
-
-  if (payload.title) {
-    item.title = payload.title;
-  }
-
-  if (payload.detail) {
-    item.detail = payload.detail;
-  }
-
-  if (payload.outputPath) {
-    item.outputPath = payload.outputPath;
-  }
-
-  if (payload.error) {
-    item.error = payload.error;
-  }
+  applyJobProgress(item, payload);
 
   if (payload.status !== previousStatus) {
     if (payload.status === 'done') {
