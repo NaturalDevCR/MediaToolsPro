@@ -32,6 +32,8 @@ export interface DownloadJobRequest {
   format: string;
   quality: string;
   formatId?: string;
+  /** Whether the picked formatId already has audio; false → mux in best audio. */
+  formatHasAudio?: boolean;
   outputPath: string;
   playlistMode: PlaylistMode;
   audioTarget: AudioTarget;

@@ -88,14 +88,25 @@ pub fn build_download_args(
     let recode = req.recode.unwrap_or(false);
 
     if let Some(format_id) = req.format_id.as_deref().filter(|s| !s.is_empty()) {
+        // A video-only stream picked from the explorer has no audio; mux in best
+        // audio (falling back to the bare stream if it can't be combined).
+        let needs_audio = !is_audio && req.format_has_audio == Some(false);
         args.push("-f".into());
-        args.push(format_id.to_string());
+        if needs_audio {
+            args.push(format!("{id}+ba/{id}", id = format_id));
+        } else {
+            args.push(format_id.to_string());
+        }
         if is_audio {
             push_audio_extract(&mut args, &req.format, &req.quality);
         } else if recode {
             args.push("--recode-video".into());
             args.push(req.format.clone());
         } else {
+            if needs_audio {
+                args.push("--merge-output-format".into());
+                args.push(req.format.clone());
+            }
             args.push("--remux-video".into());
             args.push(req.format.clone());
         }
@@ -186,6 +197,7 @@ mod tests {
             format: "mp4".into(),
             quality: "1080".into(),
             format_id: None,
+            format_has_audio: None,
             output_path: "/out".into(),
             playlist_mode: Some("single".into()),
             audio_target: None,
@@ -214,6 +226,27 @@ mod tests {
         assert!(pair(&args, "--remux-video", "mp4"));
         assert!(!args.iter().any(|a| a == "--recode-video"));
         assert!(pair(&args, "-f", "bv*[height<=1080]+ba/b[height<=1080]/b"));
+    }
+
+    #[test]
+    fn video_only_format_id_muxes_in_audio() {
+        let mut req = base_req();
+        req.format_id = Some("137".into());
+        req.format_has_audio = Some(false);
+        let args = build_download_args(&req, "/ff", Some("tv"), false);
+        assert!(pair(&args, "-f", "137+ba/137"));
+        assert!(pair(&args, "--merge-output-format", "mp4"));
+        assert!(pair(&args, "--remux-video", "mp4"));
+    }
+
+    #[test]
+    fn combined_format_id_stays_single_stream() {
+        let mut req = base_req();
+        req.format_id = Some("18".into());
+        req.format_has_audio = Some(true);
+        let args = build_download_args(&req, "/ff", Some("tv"), false);
+        assert!(pair(&args, "-f", "18"));
+        assert!(!args.iter().any(|a| a == "--merge-output-format"));
     }
 
     #[test]

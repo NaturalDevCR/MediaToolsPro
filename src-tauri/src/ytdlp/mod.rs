@@ -31,6 +31,9 @@ pub struct DownloadRequest {
     pub format: String,
     pub quality: String,
     pub format_id: Option<String>,
+    /// Whether the explicitly-picked `format_id` already contains an audio track.
+    /// `Some(false)` (a video-only stream) tells the builder to mux in best audio.
+    pub format_has_audio: Option<bool>,
     pub output_path: String,
     pub playlist_mode: Option<String>,
     pub audio_target: Option<String>,

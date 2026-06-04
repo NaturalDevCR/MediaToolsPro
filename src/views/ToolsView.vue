@@ -1243,6 +1243,7 @@ function buildCurrentDownloadSettings(outputPath: string): Omit<DownloadJobReque
     format: format.value,
     quality: quality.value,
     formatId: selectedFormatId.value ?? undefined,
+    formatHasAudio: selectedFormat.value?.hasAudio,
     outputPath,
     playlistMode: playlistMode.value,
     audioTarget: 'general',
