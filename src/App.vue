@@ -2,7 +2,7 @@
 import { ref, onMounted, watch } from "vue";
 import Header from "./components/layout/Header.vue";
 import Footer from "./components/layout/Footer.vue";
-import ToolsView from "./views/Downloader.vue";
+import ToolsView from "./views/ToolsView.vue";
 import Settings from "./views/Settings.vue";
 import Logs from "./views/Logs.vue";
 import { addLog } from "./stores/logs";
