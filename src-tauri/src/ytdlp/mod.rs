@@ -1,7 +1,6 @@
 use crate::jobs::{
     emit_job_progress, emit_log, media_kind_for_format, JobProgressPayload, JobState,
 };
-use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -18,6 +17,11 @@ mod args;
 mod clients;
 mod errors;
 mod progress;
+
+use args::{build_download_args, is_youtube_url};
+use clients::{should_try_next_client, YOUTUBE_CLIENT_CHAIN};
+use errors::normalize_error;
+use progress::{parse_progress_line, ProgressEvent};
 
 #[derive(Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -132,7 +136,7 @@ fn run_ytdlp_list_formats(
 
     if is_youtube_url(url) && !has_cookies {
         args.push("--extractor-args".to_string());
-        args.push("youtube:player_client=android_vr".to_string());
+        args.push(format!("youtube:player_client={}", YOUTUBE_CLIENT_CHAIN[0]));
     }
 
     if has_cookies {
@@ -291,15 +295,48 @@ pub async fn start_download<R: Runtime>(
     tokio::spawn(async move {
         let mut current_request = request.clone();
 
-        let result = run_download_process(
-            app_handle.clone(),
-            current_request.clone(),
-            Arc::clone(&pid),
-            Arc::clone(&cancelled),
-        )
-        .await;
+        let mut last_err: Option<String> = None;
+        let max_attempts = if is_youtube_url(&url) && current_request.cookies_file.is_none() {
+            YOUTUBE_CLIENT_CHAIN.len()
+        } else {
+            1
+        };
 
-        let final_result = if let Err(ref error) = result {
+        for attempt in 0..max_attempts {
+            match run_download_process(
+                app_handle.clone(),
+                current_request.clone(),
+                Arc::clone(&pid),
+                Arc::clone(&cancelled),
+                attempt,
+            )
+            .await
+            {
+                Ok(()) => {
+                    last_err = None;
+                    break;
+                }
+                Err(error) => {
+                    if cancelled.load(Ordering::SeqCst) {
+                        last_err = Some(error);
+                        break;
+                    }
+                    if attempt + 1 < max_attempts && should_try_next_client(&error) {
+                        emit_log(
+                            &app_handle,
+                            format!("Retrying with next YouTube client ({})", error),
+                            "warn",
+                        );
+                        last_err = Some(error);
+                        continue;
+                    }
+                    last_err = Some(error);
+                    break;
+                }
+            }
+        }
+
+        let final_result = if let Some(ref error) = last_err {
             if request.cookies_file.is_some()
                 && !cancelled.load(Ordering::SeqCst)
                 && looks_like_public_video_failure(error)
@@ -337,13 +374,14 @@ pub async fn start_download<R: Runtime>(
                     current_request,
                     Arc::clone(&pid),
                     Arc::clone(&cancelled),
+                    0,
                 )
                 .await
             } else {
-                result
+                Err(error.clone())
             }
         } else {
-            result
+            Ok(())
         };
 
         if let Err(error) = final_result {
@@ -416,17 +454,11 @@ async fn run_download_process<R: Runtime>(
     request: DownloadRequest,
     pid: Arc<Mutex<Option<u32>>>,
     cancelled: Arc<AtomicBool>,
+    attempt_index: usize,
 ) -> Result<(), String> {
     if cancelled.load(Ordering::SeqCst) {
         return Err("Cancelled before download started".into());
     }
-
-    let is_audio_request = matches!(
-        request.format.as_str(),
-        "mp3" | "wav" | "flac" | "m4a" | "aac" | "ogg" | "opus"
-    );
-    let effective_format = request.format.clone();
-    let effective_quality = request.quality.clone();
 
     let bin_dir = app.path().app_data_dir().unwrap().join("bin");
     let ytdlp_path = bin_dir.join(if cfg!(windows) {
@@ -440,18 +472,6 @@ async fn run_download_process<R: Runtime>(
         return Err("yt-dlp binary is missing. Install it from Settings first.".into());
     }
 
-    let mut args = vec![
-        "--newline".to_string(),
-        "--no-warnings".to_string(),
-        "--ffmpeg-location".to_string(),
-        ffmpeg_dir.to_string_lossy().to_string(),
-        "-P".to_string(),
-        request.output_path.clone(),
-        "--progress".to_string(),
-        "--print".to_string(),
-        "after_move:filepath".to_string(),
-    ];
-
     let has_cookies = request
         .cookies_file
         .as_ref()
@@ -459,76 +479,16 @@ async fn run_download_process<R: Runtime>(
         .map(|p| Path::new(p.trim()).is_file())
         .unwrap_or(false);
 
-    if is_youtube_url(&request.url) && !has_cookies {
-        // Use a YouTube client that currently avoids PO-Token-gated 403 failures
-        // on public media downloads more reliably than the default client selection.
-        args.push("--extractor-args".to_string());
-        args.push("youtube:player_client=android_vr".to_string());
-    }
-
-    if has_cookies {
-        args.push("--cookies".to_string());
-        args.push(request.cookies_file.as_ref().unwrap().trim().to_string());
-    }
-
-    match request.playlist_mode.as_deref() {
-        Some("playlist") => args.push("--yes-playlist".to_string()),
-        Some("single") => args.push("--no-playlist".to_string()),
-        _ if is_youtube_radio_mix_url(&request.url) => args.push("--no-playlist".to_string()),
-        _ if request.url.contains("list=") => args.push("--yes-playlist".to_string()),
-        _ => args.push("--no-playlist".to_string()),
-    }
-
-    if let Some(format_id) = request.format_id.as_ref().filter(|v| !v.is_empty()) {
-        // User picked an exact format from the explorer
-        args.push("-f".to_string());
-        args.push(format_id.clone());
-
-        if is_audio_request {
-            args.push("-x".to_string());
-            args.push("--audio-format".to_string());
-            args.push(audio_format_for_ytdlp(&effective_format).to_string());
-
-            if effective_quality != "best" {
-                args.push("--audio-quality".to_string());
-                args.push(format!("{}K", effective_quality));
-            } else {
-                args.push("--audio-quality".to_string());
-                args.push("0".to_string());
-            }
-        } else {
-            args.push("--recode-video".to_string());
-            args.push(effective_format.clone());
-        }
-    } else if is_audio_request {
-        args.push("-x".to_string());
-        args.push("--audio-format".to_string());
-        args.push(audio_format_for_ytdlp(&effective_format).to_string());
-
-        if effective_quality != "best" {
-            args.push("--audio-quality".to_string());
-            args.push(format!("{}K", effective_quality));
-        } else {
-            args.push("--audio-quality".to_string());
-            args.push("0".to_string());
-        }
+    let client = if is_youtube_url(&request.url) && !has_cookies {
+        Some(YOUTUBE_CLIENT_CHAIN[attempt_index.min(YOUTUBE_CLIENT_CHAIN.len() - 1)])
     } else {
-        args.push("--recode-video".to_string());
-        args.push(effective_format.clone());
-
-        if effective_quality != "best" {
-            args.push("-f".to_string());
-            args.push(format!(
-                "bestvideo[height<={}]+bestaudio/best[height<={}]/best",
-                effective_quality, effective_quality
-            ));
-        } else {
-            args.push("-f".to_string());
-            args.push("bestvideo+bestaudio/best".to_string());
-        }
+        None
+    };
+    if let Some(client) = client {
+        emit_log(&app, format!("Using YouTube client: {}", client), "info");
     }
-
-    args.push(request.url.clone());
+    let ffmpeg_dir_arg = ffmpeg_dir.to_string_lossy().to_string();
+    let args = build_download_args(&request, &ffmpeg_dir_arg, client, has_cookies);
 
     let mut child = Command::new(&ytdlp_path)
         .args(&args)
@@ -560,12 +520,6 @@ async fn run_download_process<R: Runtime>(
         buffer
     });
 
-    let re_progress = Regex::new(
-        r"\[download\]\s+(\d+(?:\.\d+)?)%\s+of\s+~?([^ ]+)\s+at\s+([^ ]+)\s+ETA\s+([^ ]+)",
-    )
-    .unwrap();
-    let re_percent = Regex::new(r"\[download\]\s+(\d+(?:\.\d+)?)%").unwrap();
-
     let mut title = Some(request.url.clone());
     let mut output_path = None::<String>;
 
@@ -592,8 +546,13 @@ async fn run_download_process<R: Runtime>(
             return Err("Cancelled by user".into());
         }
 
-        if line.starts_with("[download]") {
-            if let Some(caps) = re_progress.captures(&line) {
+        match parse_progress_line(&line) {
+            Some(ProgressEvent::Progress {
+                percent,
+                speed,
+                eta,
+                total,
+            }) => {
                 emit_job_progress(
                     &app,
                     JobProgressPayload {
@@ -601,10 +560,10 @@ async fn run_download_process<R: Runtime>(
                         job_kind: "download".into(),
                         media_kind: media_kind_for_format(&request.format).into(),
                         status: "downloading".into(),
-                        percent: caps[1].parse::<f64>().unwrap_or(0.0),
-                        speed: caps[3].to_string(),
-                        eta: caps[4].to_string(),
-                        total_size: caps[2].to_string(),
+                        percent,
+                        speed,
+                        eta,
+                        total_size: total,
                         title: title.clone(),
                         detail: output_path
                             .clone()
@@ -613,7 +572,8 @@ async fn run_download_process<R: Runtime>(
                         error: None,
                     },
                 );
-            } else if let Some(percent) = re_percent.captures(&line) {
+            }
+            Some(ProgressEvent::Percent(percent)) => {
                 emit_job_progress(
                     &app,
                     JobProgressPayload {
@@ -621,7 +581,7 @@ async fn run_download_process<R: Runtime>(
                         job_kind: "download".into(),
                         media_kind: media_kind_for_format(&request.format).into(),
                         status: "downloading".into(),
-                        percent: percent[1].parse::<f64>().unwrap_or(0.0),
+                        percent,
                         speed: "-".into(),
                         eta: "-".into(),
                         total_size: "-".into(),
@@ -633,34 +593,12 @@ async fn run_download_process<R: Runtime>(
                         error: None,
                     },
                 );
-            } else if let Some(destination) = extract_destination(&line) {
-                output_path = Some(destination.clone());
-                title = Some(
-                    Path::new(&destination)
-                        .file_name()
-                        .and_then(|value| value.to_str())
-                        .unwrap_or(&destination)
-                        .to_string(),
-                );
-
-                emit_job_progress(
-                    &app,
-                    JobProgressPayload {
-                        id: request.id.clone(),
-                        job_kind: "download".into(),
-                        media_kind: media_kind_for_format(&request.format).into(),
-                        status: "downloading".into(),
-                        percent: 0.0,
-                        speed: "-".into(),
-                        eta: "-".into(),
-                        total_size: "-".into(),
-                        title: title.clone(),
-                        detail: Some("Destination resolved".into()),
-                        output_path: output_path.clone(),
-                        error: None,
-                    },
-                );
-            } else if line.contains("100%") {
+            }
+            Some(ProgressEvent::Destination(dest)) => {
+                title = Some(file_label(&dest));
+                output_path = Some(dest);
+            }
+            Some(ProgressEvent::PostProcess(detail)) => {
                 emit_job_progress(
                     &app,
                     JobProgressPayload {
@@ -673,36 +611,19 @@ async fn run_download_process<R: Runtime>(
                         eta: "00:00".into(),
                         total_size: "-".into(),
                         title: title.clone(),
-                        detail: Some("Finalizing file".into()),
+                        detail: Some(detail),
                         output_path: output_path.clone(),
                         error: None,
                     },
                 );
             }
-        } else if !line.starts_with('[') && Path::new(line.trim()).exists() {
-            output_path = Some(line.trim().to_string());
-            title = Some(file_label(line.trim()));
-        } else if line.starts_with("[ExtractAudio]")
-            || line.starts_with("[Merger]")
-            || line.starts_with("[VideoRemuxer]")
-        {
-            emit_job_progress(
-                &app,
-                JobProgressPayload {
-                    id: request.id.clone(),
-                    job_kind: "download".into(),
-                    media_kind: media_kind_for_format(&request.format).into(),
-                    status: "converting".into(),
-                    percent: 100.0,
-                    speed: "-".into(),
-                    eta: "00:00".into(),
-                    total_size: "-".into(),
-                    title: title.clone(),
-                    detail: Some(line.clone()),
-                    output_path: output_path.clone(),
-                    error: None,
-                },
-            );
+            None => {
+                let trimmed = line.trim();
+                if !trimmed.starts_with('[') && Path::new(trimmed).exists() {
+                    output_path = Some(trimmed.to_string());
+                    title = Some(file_label(trimmed));
+                }
+            }
         }
     }
 
@@ -740,23 +661,8 @@ async fn run_download_process<R: Runtime>(
             .find(|line| !line.trim().is_empty())
             .cloned()
             .unwrap_or_else(|| "yt-dlp exited with an error".into());
-        Err(normalize_download_error(&request, stderr_excerpt))
+        Err(normalize_error(&stderr_excerpt, has_cookies))
     }
-}
-
-fn audio_format_for_ytdlp(format: &str) -> &str {
-    match format {
-        "ogg" => "vorbis",
-        other => other,
-    }
-}
-
-fn extract_destination(line: &str) -> Option<String> {
-    line.split("Destination:")
-        .nth(1)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
 }
 
 fn file_label(path: &str) -> String {
@@ -767,18 +673,6 @@ fn file_label(path: &str) -> String {
         .to_string()
 }
 
-fn is_youtube_url(url: &str) -> bool {
-    url.contains("youtube.com/") || url.contains("youtu.be/")
-}
-
-fn is_youtube_radio_mix_url(url: &str) -> bool {
-    if !is_youtube_url(url) {
-        return false;
-    }
-
-    url.contains("start_radio=1") || url.contains("list=RD")
-}
-
 fn managed_cookies_file_path<R: Runtime>(app: &AppHandle<R>) -> Result<PathBuf, String> {
     Ok(app
         .path()
@@ -786,37 +680,6 @@ fn managed_cookies_file_path<R: Runtime>(app: &AppHandle<R>) -> Result<PathBuf, 
         .map_err(|error| error.to_string())?
         .join("auth")
         .join("cookies.txt"))
-}
-
-fn normalize_download_error(request: &DownloadRequest, message: String) -> String {
-    if request
-        .cookies_file
-        .as_ref()
-        .filter(|value| !value.trim().is_empty())
-        .is_some()
-        && looks_like_cookie_auth_issue(&message)
-    {
-        return format!(
-            "{} The saved internal cookies.txt may be expired or no longer valid. Export a fresh cookies.txt and import it again from the app.",
-            message
-        );
-    }
-
-    message
-}
-
-fn looks_like_cookie_auth_issue(message: &str) -> bool {
-    let normalized = message.to_lowercase();
-
-    normalized.contains("sign in")
-        || normalized.contains("login")
-        || normalized.contains("cookies")
-        || normalized.contains("confirm you're not a bot")
-        || normalized.contains("age-restricted")
-        || normalized.contains("members-only")
-        || normalized.contains("authentication")
-        || normalized.contains("private video")
-        || normalized.contains("premium")
 }
 
 fn looks_like_public_video_failure(message: &str) -> bool {
