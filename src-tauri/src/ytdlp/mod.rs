@@ -32,6 +32,15 @@ pub struct DownloadRequest {
     pub audio_target: Option<String>,
     pub video_target: Option<String>,
     pub cookies_file: Option<String>,
+    pub recode: Option<bool>,
+    pub embed_thumbnail: Option<bool>,
+    pub embed_metadata: Option<bool>,
+    pub embed_chapters: Option<bool>,
+    pub embed_subs: Option<bool>,
+    pub sub_langs: Option<String>,
+    pub sponsorblock: Option<String>,
+    pub playlist_items: Option<String>,
+    pub output_template: Option<String>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -825,4 +834,21 @@ fn looks_like_public_video_failure(message: &str) -> bool {
         || normalized.contains("members-only")
         || normalized.contains("authentication")
         || normalized.contains("premium")
+}
+
+#[cfg(test)]
+mod request_tests {
+    use super::DownloadRequest;
+
+    #[test]
+    fn deserializes_legacy_payload_with_defaults() {
+        let json = r#"{
+            "id":"x","url":"https://youtu.be/a","format":"mp4","quality":"best",
+            "outputPath":"/out"
+        }"#;
+        let req: DownloadRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.recode, None);
+        assert_eq!(req.embed_thumbnail, None);
+        assert_eq!(req.sponsorblock, None);
+    }
 }
