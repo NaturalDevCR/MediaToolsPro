@@ -1,4 +1,4 @@
-import { defineConfig } from "vitest/config";
+import { defineConfig, configDefaults } from "vitest/config";
 import vue from "@vitejs/plugin-vue";
 
 // @ts-expect-error process is a nodejs global
@@ -9,6 +9,9 @@ export default defineConfig(async () => ({
   plugins: [vue()],
   test: {
     environment: "jsdom",
+    // Never scan git worktrees created under .claude/ (agent worktrees carry
+    // duplicate copies of the test files and pollute the run).
+    exclude: [...configDefaults.exclude, "**/.claude/**"],
   },
 
   // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`

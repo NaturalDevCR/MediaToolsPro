@@ -33,6 +33,9 @@ test-results
 !.env.example
 *.local
 
+# Agent worktrees (created by background agents under .claude/)
+.claude/worktrees/
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
