@@ -240,23 +240,23 @@ pub async fn list_formats<R: Runtime>(
             }
         });
 
-    // Try with cookies first if available
-    if let Some(ref path) = cookies_path {
-        match run_ytdlp_list_formats(&ytdlp_path, &request.url, Some(path)) {
-            Ok(response) => return Ok(response),
-            Err(err) => {
-                // If it looks like a cookie/public video issue, retry without cookies
-                if looks_like_public_video_failure(&err) {
-                    emit_log(&app, "Format listing failed with cookies, retrying without cookies...", "warn");
-                    return run_ytdlp_list_formats(&ytdlp_path, &request.url, None);
+    // Try WITHOUT cookies first.
+    // YouTube often serves DRM-only formats to logged-in sessions while
+    // anonymous requests can still access non-DRM streams.
+    match run_ytdlp_list_formats(&ytdlp_path, &request.url, None) {
+        Ok(response) => return Ok(response),
+        Err(no_cookie_err) => {
+            // If we have cookies and the anonymous attempt looks like it might
+            // succeed with authentication, try with cookies.
+            if let Some(ref path) = cookies_path {
+                if !looks_like_public_video_failure(&no_cookie_err) {
+                    emit_log(&app, "Anonymous format listing failed, retrying with cookies...", "warn");
+                    return run_ytdlp_list_formats(&ytdlp_path, &request.url, Some(path));
                 }
-                return Err(err);
             }
+            return Err(no_cookie_err);
         }
     }
-
-    // No cookies, use public fallback
-    run_ytdlp_list_formats(&ytdlp_path, &request.url, None)
 }
 
 #[tauri::command]
@@ -276,6 +276,12 @@ pub async fn start_download<R: Runtime>(
 
     tokio::spawn(async move {
         let mut current_request = request.clone();
+        let had_cookies = current_request.cookies_file.is_some();
+
+        // Phase 1: try WITHOUT cookies first.
+        // YouTube sometimes serves DRM-only or blocked formats to logged-in
+        // sessions; anonymous requests often have better luck.
+        current_request.cookies_file = None;
 
         let result = run_download_process(
             app_handle.clone(),
@@ -285,20 +291,22 @@ pub async fn start_download<R: Runtime>(
         )
         .await;
 
+        // Phase 2: if the anonymous attempt failed and we originally had cookies,
+        // try with cookies as a last resort.
         let final_result = if let Err(ref error) = result {
-            if request.cookies_file.is_some()
+            if had_cookies
                 && !cancelled.load(Ordering::SeqCst)
-                && looks_like_public_video_failure(error)
+                && !looks_like_public_video_failure(error)
             {
                 emit_log(
                     &app_handle,
                     format!(
-                        "Download failed with cookies ({}), retrying without cookies...",
+                        "Anonymous download failed ({}), retrying with cookies...",
                         error
                     ),
                     "warn",
                 );
-                current_request.cookies_file = None;
+                current_request.cookies_file = request.cookies_file.clone();
 
                 emit_job_progress(
                     &app_handle,
@@ -312,7 +320,7 @@ pub async fn start_download<R: Runtime>(
                         eta: "-".into(),
                         total_size: "-".into(),
                         title: Some(url.clone()),
-                        detail: Some("Retrying without cookies...".into()),
+                        detail: Some("Retrying with cookies...".into()),
                         output_path: None,
                         error: None,
                     },
@@ -775,6 +783,12 @@ fn managed_cookies_file_path<R: Runtime>(app: &AppHandle<R>) -> Result<PathBuf, 
 }
 
 fn normalize_download_error(request: &DownloadRequest, message: String) -> String {
+    let normalized = message.to_lowercase();
+
+    if normalized.contains("drm protected") || normalized.contains("drm") {
+        return "YouTube is serving DRM-only formats for this video. Try updating yt-dlp to the latest version in Settings, or the video may be restricted to Premium members.".into();
+    }
+
     if request
         .cookies_file
         .as_ref()
@@ -811,6 +825,9 @@ fn looks_like_public_video_failure(message: &str) -> bool {
     // When cookies are present but expired/invalid, the default extractor
     // may fail with generic availability errors on public videos.
     // This signals we should retry without cookies (using android_vr fallback).
+    // DRM errors are included because logged-in sessions sometimes receive
+    // only DRM-encumbered formats, while anonymous clients can still access
+    // non-DRM streams.
     normalized.contains("not available")
         || normalized.contains("video unavailable")
         || normalized.contains("unavailable")
@@ -820,4 +837,6 @@ fn looks_like_public_video_failure(message: &str) -> bool {
         || normalized.contains("members-only")
         || normalized.contains("authentication")
         || normalized.contains("premium")
+        || normalized.contains("drm protected")
+        || normalized.contains("drm")
 }
