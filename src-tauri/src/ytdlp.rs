@@ -822,21 +822,16 @@ fn looks_like_cookie_auth_issue(message: &str) -> bool {
 fn looks_like_public_video_failure(message: &str) -> bool {
     let normalized = message.to_lowercase();
 
-    // When cookies are present but expired/invalid, the default extractor
-    // may fail with generic availability errors on public videos.
-    // This signals we should retry without cookies (using android_vr fallback).
-    // DRM errors are included because logged-in sessions sometimes receive
-    // only DRM-encumbered formats, while anonymous clients can still access
-    // non-DRM streams.
-    normalized.contains("not available")
-        || normalized.contains("video unavailable")
-        || normalized.contains("unavailable")
-        || normalized.contains("this video is private")
-        || normalized.contains("sign in")
-        || normalized.contains("confirm you're not a bot")
-        || normalized.contains("members-only")
-        || normalized.contains("authentication")
-        || normalized.contains("premium")
-        || normalized.contains("drm protected")
+    // This function identifies errors that are CAUSED BY having cookies
+    // on a public video. When these happen, retrying WITHOUT cookies
+    // often works because anonymous sessions get different (non-DRM) formats.
+    //
+    // We keep this list VERY NARROW and specific. Generic errors like
+    // "not available", "unavailable", or "private video" are excluded
+    // because they are ambiguous and may actually NEED cookies.
+    normalized.contains("drm protected")
         || normalized.contains("drm")
+        || normalized.contains("po_token")
+        || normalized.contains("po token")
+        || normalized.contains("sign in to confirm you're not a bot")
 }
