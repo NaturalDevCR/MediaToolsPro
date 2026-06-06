@@ -13,6 +13,8 @@ pub fn should_try_next_client(error: &str) -> bool {
         || normalized.contains("requested format is not available")
         || normalized.contains("unable to extract")
         || normalized.contains("nsig")
+        || normalized.contains("drm protected")
+        || normalized.contains("drm")
 }
 
 #[cfg(test)]

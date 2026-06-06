@@ -24,6 +24,9 @@ pub fn normalize_error(raw: &str, had_cookies: bool) -> String {
     if normalized.contains("http error 403") || normalized.contains("forbidden") {
         return "Access was blocked (HTTP 403). Update yt-dlp in Settings and retry; if it persists, import cookies.".into();
     }
+    if normalized.contains("drm protected") || normalized.contains("drm") {
+        return "YouTube is serving DRM-only formats for this video. Try updating yt-dlp to the latest version in Settings, or the video may be restricted to Premium members.".into();
+    }
     if had_cookies && (normalized.contains("cookies") || normalized.contains("expired")) {
         return format!(
             "{} Your saved cookies may be expired - export a fresh cookies.txt and re-import it.",
