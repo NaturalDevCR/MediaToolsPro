@@ -1,362 +1,121 @@
-use serde::{Deserialize, Serialize};
-use std::fs;
-use std::io::Write;
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
-use std::process::Command;
+use serde::Serialize;
+use std::{fs, path::PathBuf, process::Command, time::Duration};
 use tauri::{AppHandle, Manager, Runtime};
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize)]
 pub struct BinaryStatus {
-    pub ytdlp: bool,
-    pub ytdlp_version: Option<String>,
     pub ffmpeg: bool,
     pub ffmpeg_version: Option<String>,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct BinaryVersions {
-    pub ytdlp_version: Option<String>,
-    pub ffmpeg_version: Option<String>,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct BinaryUpdateStatus {
-    pub ytdlp_update_available: bool,
-    pub ytdlp_latest_version: Option<String>,
-    pub ffmpeg_update_available: bool,
-    pub ffmpeg_latest_version: Option<String>,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
-struct VersionCache {
-    ytdlp_version: Option<String>,
-    ffmpeg_version: Option<String>,
-}
-
-fn get_bin_dir<R: Runtime>(app: &AppHandle<R>) -> PathBuf {
-    let path = app
-        .path()
+fn bin_dir<R: Runtime>(app: &AppHandle<R>) -> Result<PathBuf, String> {
+    app.path()
         .app_data_dir()
-        .expect("failed to get app data dir")
-        .join("bin");
-    if !path.exists() {
-        fs::create_dir_all(&path).expect("failed to create bin dir");
-    }
-    path
+        .map(|path| path.join("bin"))
+        .map_err(|e| e.to_string())
 }
-
-fn get_ytdlp_name() -> &'static str {
-    if cfg!(target_os = "windows") {
-        "yt-dlp.exe"
-    } else {
-        "yt-dlp"
-    }
-}
-
-fn get_ffmpeg_name() -> &'static str {
-    if cfg!(target_os = "windows") {
+fn binary_name() -> &'static str {
+    if cfg!(windows) {
         "ffmpeg.exe"
     } else {
         "ffmpeg"
     }
 }
-
-fn cache_path(bin_dir: &PathBuf) -> PathBuf {
-    bin_dir.join(".versions.json")
-}
-
-fn read_cache(bin_dir: &PathBuf) -> VersionCache {
-    let path = cache_path(bin_dir);
-    if let Ok(data) = fs::read_to_string(&path) {
-        serde_json::from_str(&data).unwrap_or_default()
-    } else {
-        VersionCache::default()
+pub fn ffmpeg_path<R: Runtime>(app: &AppHandle<R>) -> Result<PathBuf, String> {
+    let installed = bin_dir(app)?.join(binary_name());
+    let mut candidates = vec![installed, PathBuf::from("ffmpeg")];
+    if cfg!(target_os = "macos") {
+        candidates.extend([
+            PathBuf::from("/opt/homebrew/bin/ffmpeg"),
+            PathBuf::from("/usr/local/bin/ffmpeg"),
+        ]);
     }
-}
-
-fn write_cache(bin_dir: &PathBuf, cache: &VersionCache) {
-    let path = cache_path(bin_dir);
-    if let Ok(json) = serde_json::to_string(cache) {
-        let _ = fs::write(&path, json);
-    }
-}
-
-fn run_ytdlp_version(binary: &PathBuf) -> Option<String> {
-    Command::new(binary)
-        .arg("--version")
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
-}
-
-fn run_ffmpeg_version(binary: &PathBuf) -> Option<String> {
-    Command::new(binary)
-        .arg("-version")
-        .output()
-        .ok()
-        .and_then(|o| {
-            let out = String::from_utf8_lossy(&o.stdout);
-            out.lines().next().map(|s| s.to_string())
+    candidates
+        .into_iter()
+        .find(|path| {
+            Command::new(path)
+                .arg("-version")
+                .output()
+                .is_ok_and(|o| o.status.success())
         })
+        .ok_or_else(|| "FFmpeg no está disponible. Instálalo desde Ajustes.".into())
 }
-
-fn cache_single(bin_dir: &PathBuf, name: &str) {
-    let binary = bin_dir.join(name);
-    if !binary.exists() {
-        return;
-    }
-    let mut cache = read_cache(bin_dir);
-    if name == get_ytdlp_name() {
-        cache.ytdlp_version = run_ytdlp_version(&binary);
-    } else if name == get_ffmpeg_name() {
-        cache.ffmpeg_version = run_ffmpeg_version(&binary);
-    }
-    write_cache(bin_dir, &cache);
-}
-
-fn clear_cached(bin_dir: &PathBuf, name: &str) {
-    let mut cache = read_cache(bin_dir);
-    if name == get_ytdlp_name() {
-        cache.ytdlp_version = None;
-    } else if name == get_ffmpeg_name() {
-        cache.ffmpeg_version = None;
-    }
-    write_cache(bin_dir, &cache);
-}
-
-fn parse_numeric_version(s: &str) -> Option<Vec<u32>> {
-    let re = regex::Regex::new(r"(\d+\.\d+(?:\.\d+)?)").ok()?;
-    let caps = re.captures(s)?;
-    let version_str = caps.get(1)?.as_str();
-    let parts: Option<Vec<u32>> = version_str.split('.').map(|p| p.parse::<u32>().ok()).collect();
-    if parts.as_ref().map_or(true, |v| v.is_empty()) {
-        return None;
-    }
-    parts
-}
-
-fn compare_versions(a: &[u32], b: &[u32]) -> std::cmp::Ordering {
-    for (va, vb) in a.iter().zip(b.iter()) {
-        match va.cmp(vb) {
-            std::cmp::Ordering::Equal => continue,
-            other => return other,
-        }
-    }
-    a.len().cmp(&b.len())
-}
-
-async fn fetch_ytdlp_latest_version() -> Option<String> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-        .ok()?;
-    let resp = client
-        .get("https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest")
-        .header("User-Agent", "MediaToolsPro")
-        .header("Accept", "application/vnd.github+json")
-        .send()
-        .await
-        .ok()?;
-    let json: serde_json::Value = resp.json().await.ok()?;
-    json["tag_name"].as_str().map(|s| s.to_string())
-}
-
 #[tauri::command]
 pub async fn check_binaries<R: Runtime>(app: AppHandle<R>) -> BinaryStatus {
-    let bin_dir = get_bin_dir(&app);
-    let ytdlp_path = bin_dir.join(get_ytdlp_name());
-    let ffmpeg_path = bin_dir.join(get_ffmpeg_name());
-    let cache = read_cache(&bin_dir);
-
-    let ytdlp_exists = ytdlp_path.exists();
-    let ffmpeg_exists = ffmpeg_path.exists();
-
-    let needs_ytdlp = ytdlp_exists && cache.ytdlp_version.is_none();
-    let needs_ffmpeg = ffmpeg_exists && cache.ffmpeg_version.is_none();
-
-    if needs_ytdlp {
-        let bin_dir_clone = bin_dir.clone();
-        tokio::spawn(async move {
-            let binary = bin_dir_clone.join(get_ytdlp_name());
-            if let Some(version) = run_ytdlp_version(&binary) {
-                let mut c = read_cache(&bin_dir_clone);
-                c.ytdlp_version = Some(version);
-                write_cache(&bin_dir_clone, &c);
-            }
+    let version = ffmpeg_path(&app)
+        .ok()
+        .and_then(|path| Command::new(path).arg("-version").output().ok())
+        .and_then(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .next()
+                .map(str::to_string)
         });
-    }
-
-    if needs_ffmpeg {
-        let bin_dir_clone = bin_dir.clone();
-        tokio::spawn(async move {
-            let binary = bin_dir_clone.join(get_ffmpeg_name());
-            if let Some(version) = run_ffmpeg_version(&binary) {
-                let mut c = read_cache(&bin_dir_clone);
-                c.ffmpeg_version = Some(version);
-                write_cache(&bin_dir_clone, &c);
-            }
-        });
-    }
-
     BinaryStatus {
-        ytdlp: ytdlp_exists,
-        ytdlp_version: cache.ytdlp_version.clone(),
-        ffmpeg: ffmpeg_exists,
-        ffmpeg_version: cache.ffmpeg_version.clone(),
+        ffmpeg: version.is_some(),
+        ffmpeg_version: version,
     }
 }
-
-#[tauri::command]
-pub async fn get_binary_versions<R: Runtime>(app: AppHandle<R>) -> BinaryVersions {
-    let bin_dir = get_bin_dir(&app);
-    let cache = read_cache(&bin_dir);
-    BinaryVersions {
-        ytdlp_version: cache.ytdlp_version,
-        ffmpeg_version: cache.ffmpeg_version,
-    }
-}
-
-#[tauri::command]
-pub async fn check_binary_updates<R: Runtime>(app: AppHandle<R>) -> Result<BinaryUpdateStatus, String> {
-    let bin_dir = get_bin_dir(&app);
-    let cache = read_cache(&bin_dir);
-
-    let (ytdlp_update, ytdlp_latest) = if let Some(ref current) = cache.ytdlp_version {
-        if let Some(latest) = fetch_ytdlp_latest_version().await {
-            let is_newer = match (parse_numeric_version(current), parse_numeric_version(&latest))
-            {
-                (Some(c), Some(l)) => compare_versions(&l, &c) == std::cmp::Ordering::Greater,
-                _ => current != &latest,
-            };
-            (is_newer, Some(latest))
-        } else {
-            (false, None)
-        }
-    } else {
-        (false, None)
-    };
-
-    Ok(BinaryUpdateStatus {
-        ytdlp_update_available: ytdlp_update,
-        ytdlp_latest_version: ytdlp_latest,
-        ffmpeg_update_available: false,
-        ffmpeg_latest_version: None,
-    })
-}
-
-#[tauri::command]
-pub async fn install_ytdlp<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
-    let bin_dir = get_bin_dir(&app);
-    let target = bin_dir.join(get_ytdlp_name());
-
-    let url = if cfg!(target_os = "windows") {
-        "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe"
-    } else if cfg!(target_os = "macos") {
-        "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_macos"
-    } else {
-        "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp"
-    };
-
-    download_file(url, &target).await?;
-
-    #[cfg(unix)]
-    {
-        let mut perms = fs::metadata(&target)
-            .map_err(|e| e.to_string())?
-            .permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&target, perms).map_err(|e| e.to_string())?;
-    }
-
-    cache_single(&bin_dir, get_ytdlp_name());
-
-    Ok(())
-}
-
 #[tauri::command]
 pub async fn install_ffmpeg<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
-    let bin_dir = get_bin_dir(&app);
-    let ffmpeg_target = bin_dir.join(get_ffmpeg_name());
-
-    let (url, is_zip) = if cfg!(target_os = "macos") {
-        ("https://evermeet.cx/ffmpeg/getrelease/zip", true)
-    } else if cfg!(target_os = "windows") {
-        (
-            "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip",
-            true,
-        )
+    let dir = bin_dir(&app)?;
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let url = if cfg!(target_os = "macos") {
+        "https://evermeet.cx/ffmpeg/getrelease/zip"
+    } else if cfg!(windows) {
+        "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
     } else {
-        (
-            "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz",
-            false,
-        )
+        return Err(
+            "Instala FFmpeg con el gestor de paquetes de tu sistema y vuelve a comprobar.".into(),
+        );
     };
-
-    if is_zip {
-        let tmp_zip = bin_dir.join("ffmpeg.zip");
-        download_file(url, &tmp_zip).await?;
-
-        let file = fs::File::open(&tmp_zip).map_err(|e| e.to_string())?;
-        let mut archive = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
-
-        for i in 0..archive.len() {
-            let mut file = archive.by_index(i).map_err(|e| e.to_string())?;
-            let name = file.name();
-            if name.ends_with("ffmpeg") || name.ends_with("ffmpeg.exe") {
-                let mut outfile = fs::File::create(&ffmpeg_target).map_err(|e| e.to_string())?;
-                std::io::copy(&mut file, &mut outfile).map_err(|e| e.to_string())?;
-                break;
-            }
-        }
-
-        let _ = fs::remove_file(tmp_zip);
-
-        #[cfg(unix)]
-        {
-            if ffmpeg_target.exists() {
-                let mut perms = fs::metadata(&ffmpeg_target)
-                    .map_err(|e| e.to_string())?
-                    .permissions();
-                perms.set_mode(0o755);
-                fs::set_permissions(&ffmpeg_target, perms).map_err(|e| e.to_string())?;
-            }
-        }
-    }
-
-    cache_single(&bin_dir, get_ffmpeg_name());
-
-    Ok(())
-}
-
-async fn download_file(url: &str, path: &PathBuf) -> Result<(), String> {
-    let response = reqwest::get(url).await.map_err(|e| e.to_string())?;
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(300))
+        .build()
+        .map_err(|e| e.to_string())?
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .error_for_status()
+        .map_err(|e| e.to_string())?;
     let bytes = response.bytes().await.map_err(|e| e.to_string())?;
-    let mut file = fs::File::create(path).map_err(|e| e.to_string())?;
-    file.write_all(&bytes).map_err(|e| e.to_string())?;
-    Ok(())
-}
-
-#[tauri::command]
-pub async fn delete_ytdlp<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
-    let bin_dir = get_bin_dir(&app);
-    let target = bin_dir.join(get_ytdlp_name());
-    if target.exists() {
-        fs::remove_file(&target).map_err(|e| e.to_string())?;
+    let mut archive =
+        zip::ZipArchive::new(std::io::Cursor::new(bytes)).map_err(|e| e.to_string())?;
+    let staging = dir.join(if cfg!(windows) {
+        "ffmpeg.installing.exe"
+    } else {
+        "ffmpeg.installing"
+    });
+    let mut found = false;
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index).map_err(|e| e.to_string())?;
+        if std::path::Path::new(entry.name())
+            .file_name()
+            .is_some_and(|name| name == binary_name())
+        {
+            let mut file = fs::File::create(&staging).map_err(|e| e.to_string())?;
+            std::io::copy(&mut entry, &mut file).map_err(|e| e.to_string())?;
+            found = true;
+            break;
+        }
     }
-    clear_cached(&bin_dir, get_ytdlp_name());
-    Ok(())
-}
-
-#[tauri::command]
-pub async fn delete_ffmpeg<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
-    let bin_dir = get_bin_dir(&app);
-    let target = bin_dir.join(get_ffmpeg_name());
-    if target.exists() {
-        fs::remove_file(&target).map_err(|e| e.to_string())?;
+    if !found {
+        return Err("El paquete no contiene FFmpeg.".into());
     }
-    clear_cached(&bin_dir, get_ffmpeg_name());
-    Ok(())
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&staging, fs::Permissions::from_mode(0o755))
+            .map_err(|e| e.to_string())?;
+    }
+    let valid = Command::new(&staging)
+        .arg("-version")
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if !valid {
+        let _ = fs::remove_file(staging);
+        return Err("No se pudo ejecutar el motor descargado.".into());
+    }
+    fs::rename(staging, dir.join(binary_name())).map_err(|e| e.to_string())
 }

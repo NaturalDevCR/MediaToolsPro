@@ -1,0 +1,1893 @@
+<script setup lang="ts">
+import {
+  computed,
+  nextTick,
+  onMounted,
+  onUnmounted,
+  ref,
+  shallowRef,
+  watch,
+} from "vue";
+import { convertFileSrc, invoke, isTauri } from "@tauri-apps/api/core";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
+import { open } from "@tauri-apps/plugin-dialog";
+import {
+  Activity,
+  ArrowRight,
+  AudioLines,
+  Check,
+  ChevronRight,
+  FileAudio,
+  FolderOpen,
+  Layers,
+  ListOrdered,
+  LoaderCircle,
+  Minus,
+  Pause,
+  Play,
+  Plus,
+  Repeat2,
+  RotateCcw,
+  Scissors,
+  Split,
+  Upload,
+  X,
+} from "lucide-vue-next";
+import QueueItem from "../components/QueueItem.vue";
+import {
+  basename,
+  cancelItem,
+  clearHistory,
+  enqueue,
+  pendingCount,
+  queue,
+  queueReady,
+  retryItem,
+  revealOutput,
+} from "../stores/studio";
+import type {
+  MediaProbeResponse,
+  ProcessJobRequest,
+  Segment,
+  SplitMode,
+  Tool,
+  WaveformPreviewResponse,
+  WaveformLevelsResponse,
+} from "../types/jobs";
+
+import {
+  dbHeight,
+  inspectLevel,
+  quietRegions,
+  suggestThreshold,
+} from "../lib/waveform";
+
+const props = defineProps<{ active: boolean }>();
+
+type Source = { path: string; probe?: MediaProbeResponse; error?: string };
+const tools = [
+  {
+    id: "trim" as Tool,
+    name: "Trim",
+    icon: Scissors,
+    hint: "Conserva lo que importa",
+    description: "Un inicio preciso. Un final limpio.",
+  },
+  {
+    id: "split" as Tool,
+    name: "Split",
+    icon: Split,
+    hint: "De una pieza a muchas",
+    description: "Encuentra cada corte. Revisa cada segmento.",
+  },
+  {
+    id: "normalize" as Tool,
+    name: "Normalize",
+    icon: AudioLines,
+    hint: "Un nivel consistente",
+    description: "Sonoridad medida. Exportaciones consistentes.",
+  },
+];
+const tool = ref<Tool>("trim");
+const showQueue = ref(false);
+const sources = ref<Source[]>([]);
+const selectedPath = ref("");
+const selected = computed(() =>
+  sources.value.find((source) => source.path === selectedPath.value),
+);
+const duration = computed(() => selected.value?.probe?.durationSeconds || 0);
+const currentTool = computed(
+  () => tools.find((item) => item.id === tool.value)!,
+);
+const preview = ref<WaveformPreviewResponse>();
+const previewBusy = ref(false);
+const previewError = ref("");
+const error = ref("");
+const notice = ref("");
+const dragging = ref(false);
+const audio = ref<HTMLAudioElement>();
+const timeline = ref<HTMLElement>();
+const waveScroll = ref<HTMLElement>();
+const waveCanvas = ref<HTMLCanvasElement>();
+const levels = shallowRef<WaveformLevelsResponse>();
+const levelsBusy = ref(false);
+const levelsError = ref("");
+const hoverTime = ref<number | null>(null);
+const lastInspectedTime = ref<number | null>(null);
+const scrollOffset = ref(0);
+const viewportWidth = ref(0);
+let levelsToken = 0;
+let levelsId = "";
+let resizeObserver: ResizeObserver | undefined;
+let paintFrame = 0;
+const quiet = computed(() =>
+  levels.value
+    ? quietRegions(levels.value, thresholdDb.value, duration.value)
+    : [],
+);
+const inspectionTime = computed(
+  () =>
+    hoverTime.value ??
+    (playing.value ? cursor.value : (lastInspectedTime.value ?? cursor.value)),
+);
+const inspectedLevel = computed(() =>
+  levels.value ? inspectLevel(levels.value, inspectionTime.value) : null,
+);
+const inspectedSilence = computed(() =>
+  quiet.value.find(
+    (region) =>
+      inspectionTime.value >= region.startSeconds &&
+      inspectionTime.value < region.endSeconds,
+  ),
+);
+const suggestedThreshold = computed(() =>
+  inspectedLevel.value ? suggestThreshold(inspectedLevel.value.peakDb) : null,
+);
+const silenceDuration = computed(() =>
+  inspectedSilence.value
+    ? inspectedSilence.value.endSeconds - inspectedSilence.value.startSeconds
+    : 0,
+);
+const tooltipLeft = computed(
+  () =>
+    scrollOffset.value +
+    Math.max(
+      75,
+      Math.min(
+        viewportWidth.value - 75,
+        (percent(inspectionTime.value) / 100) *
+          (timeline.value?.clientWidth || 0) -
+          scrollOffset.value,
+      ),
+    ),
+);
+const rulerTicks = computed(() => {
+  if (!duration.value || !viewportWidth.value)
+    return [{ seconds: 0, label: "00:00" }];
+  const ideal = duration.value / zoom.value / 5;
+  const power = 10 ** Math.floor(Math.log10(ideal));
+  const step = [1, 2, 5, 10].find((value) => value * power >= ideal)! * power;
+  const from =
+    (scrollOffset.value / (viewportWidth.value * zoom.value)) * duration.value;
+  const to = Math.min(duration.value, from + duration.value / zoom.value);
+  const ticks = [];
+  for (
+    let value = Math.ceil(from / step) * step;
+    value <= to + 0.000001;
+    value += step
+  ) {
+    ticks.push({
+      seconds: value,
+      label: step < 1 ? time(value) : time(value).replace(/\.\d+$/, ""),
+    });
+  }
+  return ticks;
+});
+
+function dbLabel(db: number) {
+  return db <= -120 ? "−∞" : db.toFixed(1);
+}
+function schedulePaint() {
+  cancelAnimationFrame(paintFrame);
+  paintFrame = requestAnimationFrame(paintWaveform);
+}
+function waveScrolled() {
+  scrollOffset.value = waveScroll.value?.scrollLeft || 0;
+  schedulePaint();
+}
+function paintWaveform() {
+  const canvas = waveCanvas.value;
+  const scroll = waveScroll.value;
+  const track = timeline.value;
+  if (
+    !canvas ||
+    !scroll ||
+    !track ||
+    !levels.value ||
+    !duration.value ||
+    !scroll.clientWidth
+  )
+    return;
+  const width = scroll.clientWidth;
+  const height = track.clientHeight - 30;
+  const ratio = Math.min(2, window.devicePixelRatio || 1);
+  viewportWidth.value = width;
+  scrollOffset.value = scroll.scrollLeft;
+  canvas.width = Math.round(width * ratio);
+  canvas.height = Math.round(height * ratio);
+  canvas.style.width = `${width}px`;
+  canvas.style.height = `${height}px`;
+  canvas.style.left = `${scroll.scrollLeft}px`;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return;
+  ctx.scale(ratio, ratio);
+  const center = height / 2;
+  const half = center - 8;
+  const data = levels.value;
+  const samplesPerPixel = data.peaksDb.length / track.clientWidth;
+  const offset = scroll.scrollLeft;
+  if (tool.value === "split" && splitMode.value === "silence") {
+    ctx.fillStyle = "#d6ad5d15";
+    for (const region of quiet.value) {
+      if (region.endSeconds - region.startSeconds < minSilence.value) continue;
+      const left =
+        (region.startSeconds / duration.value) * track.clientWidth - offset;
+      const right =
+        (region.endSeconds / duration.value) * track.clientWidth - offset;
+      if (right >= 0 && left <= width)
+        ctx.fillRect(
+          Math.max(0, left),
+          0,
+          Math.min(width, right) - Math.max(0, left),
+          height,
+        );
+    }
+  }
+  for (let x = 0; x < width; x++) {
+    const first = Math.floor((offset + x) * samplesPerPixel);
+    const last = Math.min(
+      data.peaksDb.length,
+      Math.max(first + 1, Math.ceil((offset + x + 1) * samplesPerPixel)),
+    );
+    let peak = -120;
+    let rms = -120;
+    for (let i = first; i < last; i++) {
+      peak = Math.max(peak, data.peaksDb[i]);
+      rms = Math.max(rms, data.rmsDb[i]);
+    }
+    const amplitude = Math.max(0.5, dbHeight(peak) * half);
+    ctx.fillStyle = "#4b9c7e";
+    ctx.fillRect(x, center - amplitude, 1, amplitude * 2);
+    const body = Math.max(0.3, dbHeight(rms) * half);
+    ctx.fillStyle = "#93d8b4";
+    ctx.fillRect(x, center - body, 1, body * 2);
+  }
+  if (
+    tool.value === "split" &&
+    splitMode.value === "silence" &&
+    Number.isFinite(thresholdDb.value)
+  ) {
+    const h = dbHeight(thresholdDb.value) * half;
+    ctx.strokeStyle = "#ecc681bb";
+    ctx.setLineDash([4, 4]);
+    ctx.beginPath();
+    ctx.moveTo(0, center - h);
+    ctx.lineTo(width, center - h);
+    ctx.moveTo(0, center + h);
+    ctx.lineTo(width, center + h);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.font = "9px ui-monospace, monospace";
+    ctx.fillStyle = "#ecc681";
+    ctx.fillText(`${thresholdDb.value} dBFS`, 8, Math.max(12, center - h - 5));
+  }
+}
+async function changeZoom(value: number) {
+  const scroll = waveScroll.value;
+  const track = timeline.value;
+  let focusTime = cursor.value;
+  let screenX = scroll ? scroll.clientWidth / 2 : 0;
+  if (scroll && track && duration.value) {
+    const cursorX =
+      (cursor.value / duration.value) * track.clientWidth - scroll.scrollLeft;
+    if (cursorX >= 0 && cursorX <= scroll.clientWidth) screenX = cursorX;
+    else
+      focusTime =
+        ((scroll.scrollLeft + screenX) / track.clientWidth) * duration.value;
+  }
+  zoom.value = Math.max(1, Math.min(64, value));
+  hoverTime.value = null;
+  await nextTick();
+  if (scroll && timeline.value && duration.value)
+    scroll.scrollLeft =
+      (focusTime / duration.value) * timeline.value.clientWidth - screenX;
+  waveScrolled();
+}
+async function cancelLevels() {
+  levelsToken++;
+  levelsBusy.value = false;
+  if (levelsId) {
+    const id = levelsId;
+    levelsId = "";
+    try {
+      await invoke("cancel_job", { id });
+    } catch {
+      /* Finished. */
+    }
+  }
+}
+async function loadLevels(path: string) {
+  await cancelLevels();
+  if (selectedPath.value !== path || disposed) return;
+  const token = ++levelsToken;
+  const id = crypto.randomUUID();
+  levelsId = id;
+  levelsBusy.value = true;
+  try {
+    const result = await invoke<WaveformLevelsResponse>("analyze_waveform", {
+      inputPath: path,
+      id,
+    });
+    if (token !== levelsToken || disposed) return;
+    levels.value = result;
+    await nextTick();
+    schedulePaint();
+  } catch (e) {
+    if (token === levelsToken && !disposed) levelsError.value = String(e);
+  } finally {
+    if (token === levelsToken) {
+      levelsBusy.value = false;
+      levelsId = "";
+    }
+  }
+}
+const cursor = ref(0);
+const playing = ref(false);
+const loop = ref(false);
+const zoom = ref(1);
+const start = ref("00:00.000");
+const end = ref("");
+const fadeIn = ref(0);
+const fadeOut = ref(0);
+const splitMode = ref<SplitMode>("chapters");
+const markers = ref<number[]>([]);
+const markerInput = ref("");
+const thresholdDb = ref(-35);
+const minSilence = ref(1.5);
+const minSegment = ref(20);
+const analysisBusy = ref(false);
+const analyzedSegments = ref<Segment[]>([]);
+const format = ref("wav");
+const destination = ref("source");
+const outputDir = ref("");
+const loudness = ref(-16);
+const truePeak = ref(-1.5);
+const presets = [
+  { name: "Podcast", value: -16, hint: "Voz y contenido web" },
+  { name: "Streaming", value: -14, hint: "Música y plataformas" },
+  { name: "Broadcast", value: -23, hint: "Objetivo EBU R128" },
+];
+const extensions = [
+  "wav",
+  "flac",
+  "mp3",
+  "m4a",
+  "aac",
+  "ogg",
+  "opus",
+  "aif",
+  "aiff",
+  "mp4",
+  "mov",
+  "mkv",
+  "webm",
+];
+let previewToken = 0;
+let previewId = "";
+let analysisToken = 0;
+let analysisId = "";
+let stopDrop: (() => void) | undefined;
+let stopDrag: (() => void) | undefined;
+let disposed = false;
+
+function time(seconds: number) {
+  const ms = Math.max(0, Math.round(seconds * 1000));
+  const h = Math.floor(ms / 3600000);
+  const m = Math.floor(ms / 60000) % 60;
+  const s = Math.floor(ms / 1000) % 60;
+  return `${h ? `${String(h).padStart(2, "0")}:` : ""}${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}.${String(ms % 1000).padStart(3, "0")}`;
+}
+function parse(value: string): number | null {
+  const parts = value.trim().split(":");
+  if (!value.trim() || parts.length > 3) return null;
+  let seconds = 0;
+  for (let i = 0; i < parts.length; i++) {
+    if (!/^\d+(?:\.\d+)?$/.test(parts[i])) return null;
+    const number = Number(parts[i]);
+    if (
+      !Number.isFinite(number) ||
+      (i > 0 && number >= 60) ||
+      (i < parts.length - 1 && number % 1 !== 0)
+    )
+      return null;
+    seconds = seconds * 60 + number;
+  }
+  return seconds;
+}
+const startSeconds = computed(() => parse(start.value));
+const endSeconds = computed(() => parse(end.value));
+const selectionValid = computed(
+  () =>
+    startSeconds.value !== null &&
+    endSeconds.value !== null &&
+    startSeconds.value >= 0 &&
+    endSeconds.value <= duration.value + 0.001 &&
+    endSeconds.value - startSeconds.value >= 0.001,
+);
+const selectionDuration = computed(() =>
+  selectionValid.value ? endSeconds.value! - startSeconds.value! : 0,
+);
+const percent = (seconds: number) =>
+  duration.value
+    ? Math.max(0, Math.min(100, (seconds / duration.value) * 100))
+    : 0;
+const inRangeMarkers = computed(() =>
+  markers.value.filter(
+    (marker) =>
+      marker > (startSeconds.value || 0) &&
+      marker < (endSeconds.value || duration.value),
+  ),
+);
+const manualSegments = computed<Segment[]>(() => {
+  if (!selectionValid.value) return [];
+  const points = [
+    startSeconds.value!,
+    ...inRangeMarkers.value,
+    endSeconds.value!,
+  ];
+  return points
+    .slice(0, -1)
+    .map((point, i) => ({ startSeconds: point, endSeconds: points[i + 1] }));
+});
+const segments = computed(() =>
+  splitMode.value === "manual" ? manualSegments.value : analyzedSegments.value,
+);
+const autoReviewed = computed(
+  () => splitMode.value === "manual" || analyzedSegments.value.length > 1,
+);
+const formats = computed(() =>
+  selected.value?.probe?.mediaKind === "video" && tool.value !== "normalize"
+    ? ["mp4", "mkv", "webm", "wav", "flac", "mp3", "m4a"]
+    : ["wav", "flac", "mp3", "m4a", "ogg", "opus"],
+);
+const exportProblem = computed(() => {
+  if (!sources.value.length) return "Importa un archivo para empezar.";
+  if (!queueReady.value)
+    return "Abre la aplicación de escritorio para procesar archivos.";
+  if (destination.value === "custom" && !outputDir.value)
+    return "Selecciona la carpeta de destino.";
+  if (tool.value === "normalize") {
+    if (sources.value.some((source) => !source.probe || source.error))
+      return "Espera a que se verifiquen todos los archivos o retira los que tienen errores.";
+    if (
+      !Number.isFinite(loudness.value) ||
+      loudness.value < -30 ||
+      loudness.value > -6 ||
+      !Number.isFinite(truePeak.value) ||
+      truePeak.value < -9 ||
+      truePeak.value > 0
+    )
+      return "Revisa los objetivos de sonoridad y true peak.";
+    return "";
+  }
+  if (!selected.value?.probe) return "Selecciona un archivo válido.";
+  if (!selectionValid.value)
+    return "Revisa el inicio y el final de la selección.";
+  if (
+    tool.value === "trim" &&
+    (!Number.isFinite(fadeIn.value) ||
+      !Number.isFinite(fadeOut.value) ||
+      fadeIn.value < 0 ||
+      fadeOut.value < 0 ||
+      fadeIn.value + fadeOut.value > selectionDuration.value)
+  )
+    return "Los fades deben caber dentro de la selección.";
+  if (
+    tool.value === "split" &&
+    (!autoReviewed.value || segments.value.length < 2)
+  )
+    return splitMode.value === "manual"
+      ? "Añade al menos un corte dentro de la selección."
+      : "Analiza y revisa los segmentos antes de exportar.";
+  return "";
+});
+const audioUrl = computed(() =>
+  preview.value ? convertFileSrc(preview.value.audioPath) : "",
+);
+
+async function chooseFiles() {
+  error.value = "";
+  try {
+    const paths = await open({
+      multiple: true,
+      filters: [{ name: "Audio y video", extensions }],
+    });
+    if (paths) await addSources(Array.isArray(paths) ? paths : [paths]);
+  } catch (e) {
+    error.value = String(e);
+  }
+}
+async function addSources(paths: string[]) {
+  for (const path of paths) {
+    if (!sources.value.some((source) => source.path === path))
+      sources.value.push({ path });
+  }
+  if (!selectedPath.value) selectedPath.value = sources.value[0]?.path || "";
+  for (const path of paths) {
+    const source = sources.value.find((source) => source.path === path);
+    if (!source || source.probe) continue;
+    try {
+      source.probe = await invoke<MediaProbeResponse>("probe_media", {
+        inputPath: path,
+      });
+      source.error = undefined;
+    } catch (e) {
+      source.error = String(e);
+    }
+  }
+}
+function removeSource(path: string) {
+  sources.value = sources.value.filter((source) => source.path !== path);
+  if (selectedPath.value === path)
+    selectedPath.value = sources.value[0]?.path || "";
+}
+function stopPlayback() {
+  cancelAnimationFrame(animationFrame);
+  audio.value?.pause();
+  playing.value = false;
+}
+function seek(seconds: number) {
+  cursor.value = Math.max(0, Math.min(duration.value, seconds));
+  lastInspectedTime.value = cursor.value;
+  if (audio.value) {
+    try {
+      audio.value.currentTime = cursor.value;
+    } catch {
+      /* Metadata is still loading. */
+    }
+  }
+}
+async function playRegion(regionStart: number, regionEnd: number) {
+  if (!audio.value || !preview.value) return;
+  playbackEnd = regionEnd;
+  playbackStart = regionStart;
+  seek(regionStart);
+  try {
+    await audio.value.play();
+    playing.value = true;
+  } catch (e) {
+    previewError.value = `No se pudo reproducir la preescucha: ${String(e)}`;
+  }
+}
+let animationFrame = 0;
+function onAudioPlay() {
+  playing.value = true;
+  cancelAnimationFrame(animationFrame);
+  const frame = () => {
+    updateTime();
+    if (playing.value) animationFrame = requestAnimationFrame(frame);
+  };
+  animationFrame = requestAnimationFrame(frame);
+}
+let playbackStart = 0;
+let playbackEnd = 0;
+function togglePlayback() {
+  if (playing.value) {
+    stopPlayback();
+    return;
+  }
+  const regionStart = selectionValid.value ? startSeconds.value! : 0;
+  const regionEnd = selectionValid.value ? endSeconds.value! : duration.value;
+  void playRegion(
+    cursor.value >= regionStart && cursor.value < regionEnd - 0.01
+      ? cursor.value
+      : regionStart,
+    regionEnd,
+  );
+  playbackStart = regionStart;
+}
+function updateTime() {
+  if (!audio.value) return;
+  cursor.value = Math.min(duration.value, audio.value.currentTime);
+  if (playing.value && cursor.value >= playbackEnd) {
+    if (loop.value) seek(playbackStart);
+    else {
+      stopPlayback();
+      seek(playbackEnd);
+    }
+  }
+}
+function ended() {
+  if (loop.value) void playRegion(playbackStart, playbackEnd);
+  else stopPlayback();
+}
+function position(event: PointerEvent) {
+  const bounds = timeline.value!.getBoundingClientRect();
+  return Math.max(
+    0,
+    Math.min(
+      duration.value,
+      ((event.clientX - bounds.left) / bounds.width) * duration.value,
+    ),
+  );
+}
+function dragHandle(event: PointerEvent, handle: "start" | "end") {
+  event.preventDefault();
+  event.stopPropagation();
+  stopDrag?.();
+  stopPlayback();
+  const move = (event: PointerEvent) => {
+    const point = position(event);
+    if (handle === "start")
+      start.value = time(
+        Math.min(point, (endSeconds.value || duration.value) - 0.001),
+      );
+    else end.value = time(Math.max(point, (startSeconds.value || 0) + 0.001));
+  };
+  const cleanup = () => {
+    window.removeEventListener("pointermove", move);
+    window.removeEventListener("pointerup", cleanup);
+    window.removeEventListener("pointercancel", cleanup);
+    stopDrag = undefined;
+  };
+  window.addEventListener("pointermove", move);
+  window.addEventListener("pointerup", cleanup);
+  window.addEventListener("pointercancel", cleanup);
+  stopDrag = cleanup;
+}
+function addMarker(at = cursor.value) {
+  if (
+    !selectionValid.value ||
+    at <= startSeconds.value! ||
+    at >= endSeconds.value!
+  ) {
+    error.value = "El corte debe estar dentro de la selección.";
+    return;
+  }
+  if (markers.value.some((marker) => Math.abs(marker - at) < 0.001)) return;
+  markers.value = [...markers.value, Math.round(at * 1000) / 1000].sort(
+    (a, b) => a - b,
+  );
+  markerInput.value = "";
+  error.value = "";
+}
+function addTypedMarker() {
+  const point = parse(markerInput.value);
+  if (point === null) {
+    error.value = "Escribe un tiempo válido: mm:ss.mmm o segundos.";
+    return;
+  }
+  addMarker(point);
+}
+function resetSelection() {
+  start.value = time(0);
+  end.value = time(duration.value);
+  seek(0);
+}
+function baseRequest(path: string): ProcessJobRequest {
+  return {
+    inputPath: path,
+    outputDir: destination.value === "custom" ? outputDir.value : undefined,
+    format: format.value,
+    trimStart:
+      tool.value === "normalize" ? undefined : String(startSeconds.value),
+    trimEnd: tool.value === "normalize" ? undefined : String(endSeconds.value),
+    normalize: tool.value === "normalize",
+    loudnessTargetLufs: loudness.value,
+    truePeakDbtp: truePeak.value,
+    eq: { bass: 0, mid: 0, treble: 0 },
+    splitMode: "none",
+    manualMarkers: [],
+    silence: {
+      thresholdDb: thresholdDb.value,
+      minSilenceDuration: minSilence.value,
+      minSegmentDuration: minSegment.value,
+    },
+    fadeInDuration: tool.value === "trim" ? fadeIn.value : 0,
+    fadeOutDuration: tool.value === "trim" ? fadeOut.value : 0,
+  };
+}
+async function invalidateAnalysis() {
+  analysisToken++;
+  analyzedSegments.value = [];
+  analysisBusy.value = false;
+  if (analysisId) {
+    const id = analysisId;
+    analysisId = "";
+    try {
+      await invoke("cancel_job", { id });
+    } catch {
+      /* Already completed. */
+    }
+  }
+}
+async function analyze() {
+  if (!selectionValid.value || !selectedPath.value) return;
+  await invalidateAnalysis();
+  const token = ++analysisToken;
+  const id = crypto.randomUUID();
+  analysisId = id;
+  analysisBusy.value = true;
+  error.value = "";
+  try {
+    const result = await invoke<Segment[]>("preview_segments", {
+      request: {
+        ...baseRequest(selectedPath.value),
+        id,
+        splitMode: splitMode.value,
+      },
+    });
+    if (token !== analysisToken || disposed) return;
+    analyzedSegments.value = result;
+    if (result.length < 2)
+      error.value =
+        "No se encontraron silencios que cumplan estos parámetros. Ajusta el umbral, la pausa mínima o la duración mínima de segmento.";
+  } catch (e) {
+    if (token === analysisToken && !disposed) error.value = String(e);
+  } finally {
+    if (token === analysisToken) {
+      analysisBusy.value = false;
+      analysisId = "";
+    }
+  }
+}
+function editDetectedCuts() {
+  const cuts = analyzedSegments.value
+    .slice(1)
+    .map((segment) => segment.startSeconds);
+  splitMode.value = "manual";
+  markers.value = cuts;
+}
+async function chooseDestination() {
+  try {
+    const path = await open({ directory: true });
+    if (typeof path === "string") {
+      outputDir.value = path;
+      destination.value = "custom";
+    }
+  } catch (e) {
+    error.value = String(e);
+  }
+}
+function exportJobs() {
+  if (exportProblem.value) return;
+  try {
+    const paths =
+      tool.value === "normalize"
+        ? sources.value.map((source) => source.path)
+        : [selectedPath.value];
+    const requests = paths.map((path) => {
+      const request = baseRequest(path);
+      if (tool.value === "split") {
+        request.splitMode = "manual";
+        request.manualMarkers = segments.value
+          .slice(1)
+          .map((segment) => segment.startSeconds);
+      }
+      return request;
+    });
+    enqueue(requests, tool.value);
+    notice.value = `${requests.length} tarea(s) añadida(s) a la cola.`;
+    showQueue.value = true;
+  } catch (e) {
+    error.value = String(e);
+  }
+}
+function keydown(event: KeyboardEvent) {
+  const target = event.target as HTMLElement;
+  if (!props.active) return;
+  if (
+    event.ctrlKey ||
+    event.metaKey ||
+    event.altKey ||
+    target.matches("input, select, textarea, button") ||
+    target.isContentEditable ||
+    showQueue.value
+  )
+    return;
+  if (!selected.value?.probe || tool.value === "normalize") return;
+  if (event.code === "Space") {
+    event.preventDefault();
+    togglePlayback();
+  } else if (event.key.toLowerCase() === "i")
+    start.value = time(
+      Math.min(cursor.value, (endSeconds.value || duration.value) - 0.001),
+    );
+  else if (event.key.toLowerCase() === "o")
+    end.value = time(Math.max(cursor.value, (startSeconds.value || 0) + 0.001));
+  else if (
+    event.key.toLowerCase() === "m" &&
+    tool.value === "split" &&
+    splitMode.value === "manual"
+  )
+    addMarker();
+  else if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
+    event.preventDefault();
+    seek(
+      cursor.value +
+        (event.key === "ArrowLeft" ? -1 : 1) * (event.shiftKey ? 0.1 : 1),
+    );
+  }
+}
+async function cancelPreview() {
+  previewToken++;
+  previewBusy.value = false;
+  if (previewId) {
+    const id = previewId;
+    previewId = "";
+    try {
+      await invoke("cancel_job", { id });
+    } catch {
+      /* Finished. */
+    }
+  }
+}
+async function loadPreview(path: string) {
+  await cancelPreview();
+  if (selectedPath.value !== path || disposed) return;
+  const id = crypto.randomUUID();
+  previewId = id;
+  const token = ++previewToken;
+  previewBusy.value = true;
+  try {
+    const result = await invoke<WaveformPreviewResponse>(
+      "render_waveform_preview",
+      { inputPath: path, id },
+    );
+    if (token !== previewToken || disposed) return;
+    preview.value = result;
+  } catch (e) {
+    if (token === previewToken && !disposed) previewError.value = String(e);
+  } finally {
+    if (token === previewToken) {
+      previewBusy.value = false;
+      previewId = "";
+    }
+  }
+}
+watch(selectedPath, async (path) => {
+  void cancelPreview();
+  void cancelLevels();
+  levels.value = undefined;
+  levelsError.value = "";
+  hoverTime.value = null;
+  lastInspectedTime.value = null;
+  stopPlayback();
+  stopDrag?.();
+  void invalidateAnalysis();
+  preview.value = undefined;
+  previewError.value = "";
+  cursor.value = 0;
+  start.value = time(0);
+  end.value = duration.value ? time(duration.value) : "";
+  markers.value = [];
+  zoom.value = 1;
+  if (!path) {
+    previewBusy.value = false;
+    return;
+  }
+  if (tool.value === "normalize") {
+    previewBusy.value = false;
+    return;
+  }
+  void loadLevels(path);
+  void loadPreview(path);
+});
+watch(duration, (value) => {
+  end.value = value ? time(value) : "";
+});
+watch([start, end, splitMode, thresholdDb, minSilence, minSegment], () => {
+  void invalidateAnalysis();
+});
+watch([start, end], stopPlayback);
+watch(showQueue, (value) => {
+  if (value) stopPlayback();
+});
+watch([tool, selectedPath], () => {
+  if (!formats.value.includes(format.value)) format.value = formats.value[0];
+  stopPlayback();
+});
+watch(
+  () => props.active,
+  (active) => {
+    if (!active) stopPlayback();
+  },
+);
+watch(
+  [
+    levels,
+    zoom,
+    thresholdDb,
+    minSilence,
+    tool,
+    splitMode,
+    duration,
+    () => props.active,
+    showQueue,
+  ],
+  async () => {
+    await nextTick();
+    resizeObserver?.disconnect();
+    if (waveScroll.value) resizeObserver?.observe(waveScroll.value);
+    schedulePaint();
+  },
+);
+watch(tool, () => {
+  if (tool.value === "normalize") {
+    void cancelPreview();
+    void cancelLevels();
+  }
+  if (
+    tool.value !== "normalize" &&
+    selectedPath.value &&
+    !preview.value &&
+    !previewBusy.value
+  ) {
+    void loadPreview(selectedPath.value);
+    if (!levels.value && !levelsBusy.value) void loadLevels(selectedPath.value);
+  }
+  showQueue.value = false;
+  error.value = "";
+  notice.value = "";
+});
+onMounted(async () => {
+  window.addEventListener("keydown", keydown);
+  if (isTauri()) {
+    const unlisten = await getCurrentWebview().onDragDropEvent(
+      ({ payload }) => {
+        dragging.value = payload.type === "enter" || payload.type === "over";
+        if (payload.type === "drop") {
+          dragging.value = false;
+          void addSources(payload.paths);
+        }
+      },
+    );
+    if (disposed) unlisten();
+    else stopDrop = unlisten;
+  }
+  await nextTick();
+  resizeObserver = new ResizeObserver(schedulePaint);
+  if (waveScroll.value) resizeObserver.observe(waveScroll.value);
+});
+onUnmounted(() => {
+  disposed = true;
+  void cancelPreview();
+  void cancelLevels();
+  resizeObserver?.disconnect();
+  cancelAnimationFrame(paintFrame);
+  stopPlayback();
+  stopDrag?.();
+  stopDrop?.();
+  void invalidateAnalysis();
+  window.removeEventListener("keydown", keydown);
+});
+</script>
+
+<template>
+  <div class="studio" :class="{ 'drop-active': dragging }">
+    <aside class="studio-sidebar">
+      <div class="sidebar-label">ESTUDIO LOCAL</div>
+      <button
+        v-for="item in tools"
+        :key="item.id"
+        :aria-label="item.name"
+        :title="item.name"
+        class="tool-nav"
+        :class="{ active: tool === item.id && !showQueue }"
+        @click="
+          tool = item.id;
+          showQueue = false;
+        "
+      >
+        <component :is="item.icon" :size="20" /><span
+          ><strong>{{ item.name }}</strong
+          ><small>{{ item.hint }}</small></span
+        ><ChevronRight v-if="tool === item.id && !showQueue" :size="15" />
+      </button>
+      <div class="sidebar-divider" />
+      <button
+        class="tool-nav queue-nav"
+        aria-label="Exportaciones"
+        title="Exportaciones"
+        :class="{ active: showQueue }"
+        @click="showQueue = true"
+      >
+        <ListOrdered :size="20" /><span
+          ><strong>Exportaciones</strong
+          ><small>Progreso e historial</small></span
+        ><span v-if="pendingCount" class="count">{{ pendingCount }}</span>
+      </button>
+      <div class="sidebar-bottom">
+        <span class="status-dot" /><span
+          >Tu archivo. Tu equipo.<br /><small
+            >Procesamiento local con FFmpeg</small
+          ></span
+        >
+      </div>
+    </aside>
+
+    <div class="studio-main">
+      <template v-if="showQueue">
+        <div class="workspace-heading">
+          <div>
+            <div class="eyebrow">ESPACIO DE TRABAJO / COLA</div>
+            <h1>Exportaciones<span>.</span></h1>
+            <p>
+              {{
+                pendingCount
+                  ? `${pendingCount} tarea(s) en curso o en espera.`
+                  : "Tus resultados, en un solo lugar."
+              }}
+            </p>
+          </div>
+          <button
+            class="secondary-button"
+            :disabled="
+              !queue.some(
+                (item) => !['waiting', 'processing'].includes(item.status),
+              )
+            "
+            @click="clearHistory"
+          >
+            Limpiar historial
+          </button>
+        </div>
+        <div v-if="notice" class="notice" role="status">
+          <Check :size="16" />{{ notice
+          }}<button
+            class="icon-button"
+            aria-label="Cerrar aviso"
+            @click="notice = ''"
+          >
+            <X :size="15" />
+          </button>
+        </div>
+        <div v-if="!queue.length" class="empty-queue panel">
+          <Layers :size="36" />
+          <h2>Lista para tu primera exportación</h2>
+          <p>Prepara un recorte, divide un archivo o normaliza tu audio.</p>
+          <button class="secondary-button" @click="showQueue = false">
+            Volver al estudio <ArrowRight :size="16" />
+          </button>
+        </div>
+        <div v-else class="queue-list">
+          <QueueItem
+            v-for="item in [...queue].reverse()"
+            :key="item.id"
+            :item="item"
+            @cancel="cancelItem(item)"
+            @retry="retryItem(item)"
+            @reveal="revealOutput($event).catch((e) => (error = String(e)))"
+          />
+        </div>
+      </template>
+
+      <template v-else>
+        <div class="workspace-heading">
+          <div>
+            <div class="eyebrow">
+              ESPACIO DE TRABAJO / {{ tool.toUpperCase() }}
+            </div>
+            <h1>{{ currentTool.name }}<span>.</span></h1>
+            <p>{{ currentTool.description }}</p>
+          </div>
+          <span class="local-badge"
+            ><span class="status-dot" />ARCHIVOS LOCALES</span
+          >
+        </div>
+        <div v-if="!isTauri()" class="notice">
+          La interfaz está en modo navegador. Abre MediaToolsPro en escritorio
+          para importar y procesar archivos.
+        </div>
+        <div class="source-panel panel">
+          <div class="section-top">
+            <div>
+              <span class="step-number">01</span>
+              <h2>Archivos de origen</h2>
+              <span v-if="sources.length" class="tag">{{
+                sources.length
+              }}</span>
+            </div>
+            <button
+              class="secondary-button compact"
+              :disabled="!isTauri()"
+              @click="chooseFiles"
+            >
+              <Plus :size="15" />Añadir archivos
+            </button>
+          </div>
+          <button
+            v-if="!sources.length"
+            class="import-zone"
+            :disabled="!isTauri()"
+            @click="chooseFiles"
+          >
+            <span class="upload-icon"><Upload :size="24" /></span
+            ><strong>Arrastra tus archivos aquí</strong
+            ><span>o haz clic para explorar tu equipo</span
+            ><small>WAV, FLAC, MP3, M4A, MP4 y más formatos</small>
+          </button>
+          <div v-else class="source-list">
+            <div
+              v-for="source in sources"
+              :key="source.path"
+              class="source-row"
+              :class="{ selected: selectedPath === source.path }"
+            >
+              <button class="source-select" @click="selectedPath = source.path">
+                <FileAudio :size="19" /><span
+                  ><strong :title="source.path">{{
+                    basename(source.path)
+                  }}</strong
+                  ><small :class="{ 'error-text': source.error }">{{
+                    source.error ||
+                    (source.probe
+                      ? `${source.probe.mediaKind.toUpperCase()} · ${source.probe.durationLabel}`
+                      : "Leyendo archivo…")
+                  }}</small></span
+                ><Check
+                  v-if="selectedPath === source.path"
+                  :size="16"
+                /></button
+              ><button
+                class="icon-button"
+                aria-label="Retirar archivo"
+                title="Retirar archivo"
+                @click="removeSource(source.path)"
+              >
+                <X :size="16" />
+              </button>
+            </div>
+          </div>
+          <p v-if="sources.length > 1" class="panel-footnote">
+            {{
+              tool === "normalize"
+                ? "Se normalizará cada archivo por separado con el mismo objetivo."
+                : "Editando el archivo seleccionado. Cada exportación usa sus propios cortes."
+            }}
+          </p>
+        </div>
+
+        <div class="editor-grid">
+          <section class="editor-panel panel">
+            <div class="section-top">
+              <div>
+                <span class="step-number">02</span>
+                <h2>
+                  {{
+                    tool === "normalize"
+                      ? "Objetivo de sonoridad"
+                      : "Edición y preescucha"
+                  }}
+                </h2>
+              </div>
+              <span class="tag">{{
+                tool === "normalize" ? "DOS PASADAS" : "PRECISIÓN · 1 ms"
+              }}</span>
+            </div>
+            <template v-if="tool === 'normalize'">
+              <div class="loudness-intro">
+                <span class="loudness-symbol"><Activity :size="30" /></span>
+                <div>
+                  <h3>El mismo objetivo. Cada archivo medido.</h3>
+                  <p>
+                    Primero analizamos la sonoridad; después aplicamos el
+                    ajuste. El límite de true peak se usa en la normalización.
+                  </p>
+                </div>
+              </div>
+              <div class="preset-grid">
+                <button
+                  v-for="preset in presets"
+                  :key="preset.value"
+                  class="preset-card"
+                  :class="{ selected: loudness === preset.value }"
+                  @click="loudness = preset.value"
+                >
+                  <span
+                    >{{ preset.name
+                    }}<Check
+                      v-if="loudness === preset.value"
+                      :size="15" /></span
+                  ><strong>{{ preset.value }} <small>LUFS</small></strong>
+                  <p>{{ preset.hint }}</p>
+                </button>
+              </div>
+              <div class="fields-row loudness-fields">
+                <label
+                  >Sonoridad integrada
+                  <div class="unit-input">
+                    <input
+                      v-model.number="loudness"
+                      type="number"
+                      min="-30"
+                      max="-6"
+                      step="0.5"
+                    /><span>LUFS</span>
+                  </div></label
+                ><label
+                  >Techo de true peak
+                  <div class="unit-input">
+                    <input
+                      v-model.number="truePeak"
+                      type="number"
+                      min="-9"
+                      max="0"
+                      step="0.1"
+                    /><span>dBTP</span>
+                  </div></label
+                >
+              </div>
+              <div class="method-note">
+                <Layers :size="18" />
+                <p>
+                  Medición individual por archivo · rango objetivo de 11 LU ·
+                  salida a 48 kHz. Si el objetivo exige limitar picos o reducir
+                  el rango, el motor aplica normalización dinámica.
+                </p>
+              </div>
+            </template>
+            <template v-else>
+              <div class="timeline-toolbar">
+                <div class="transport">
+                  <button
+                    class="play-button"
+                    :disabled="!preview || !selectionValid"
+                    :aria-label="playing ? 'Pausar' : 'Reproducir selección'"
+                    @click="togglePlayback"
+                  >
+                    <Pause v-if="playing" :size="17" /><Play
+                      v-else
+                      :size="17"
+                    /></button
+                  ><span class="timecode">{{ time(cursor) }}</span
+                  ><span class="time-total">/ {{ time(duration) }}</span>
+                </div>
+                <div class="transport">
+                  <button
+                    class="icon-button"
+                    :class="{ enabled: loop }"
+                    :aria-pressed="loop"
+                    title="Repetir selección"
+                    aria-label="Repetir selección"
+                    @click="loop = !loop"
+                  >
+                    <Repeat2 :size="17" /></button
+                  ><span class="toolbar-divider" /><button
+                    class="icon-button"
+                    aria-label="Reducir zoom"
+                    :disabled="zoom <= 1"
+                    @click="changeZoom(zoom / 2)"
+                  >
+                    <Minus :size="16" /></button
+                  ><button
+                    class="zoom-reset"
+                    title="Vista completa"
+                    aria-label="Restablecer zoom"
+                    @click="changeZoom(1)"
+                  >
+                    {{ zoom }}×</button
+                  ><button
+                    class="icon-button"
+                    aria-label="Aumentar zoom"
+                    :disabled="zoom >= 64 || !levels"
+                    @click="changeZoom(zoom * 2)"
+                  >
+                    <Plus :size="16" />
+                  </button>
+                </div>
+              </div>
+              <div ref="waveScroll" class="wave-scroll" @scroll="waveScrolled">
+                <div
+                  ref="timeline"
+                  class="wave-timeline"
+                  :style="{ width: `${zoom * 100}%` }"
+                  @pointerdown="duration && seek(position($event))"
+                  @pointermove="
+                    duration &&
+                    (hoverTime = lastInspectedTime = position($event))
+                  "
+                  @pointerleave="hoverTime = null"
+                  @dblclick="
+                    tool === 'split' &&
+                    splitMode === 'manual' &&
+                    addMarker(cursor)
+                  "
+                >
+                  <div class="wave-ruler">
+                    <span
+                      v-for="tick in rulerTicks"
+                      :key="tick.seconds"
+                      :style="{ left: `${percent(tick.seconds)}%` }"
+                      >{{ tick.label }}</span
+                    >
+                  </div>
+                  <canvas
+                    v-if="levels"
+                    ref="waveCanvas"
+                    class="wave-canvas"
+                    aria-label="Forma de onda detallada con niveles medidos en dBFS"
+                  />
+                  <div v-else class="wave-placeholder">
+                    <LoaderCircle
+                      v-if="levelsBusy"
+                      class="spin"
+                      :size="24"
+                    /><AudioLines v-else :size="32" /><span>{{
+                      levelsBusy
+                        ? "Midiendo la forma de onda…"
+                        : sources.length
+                          ? "La forma de onda aparecerá aquí"
+                          : "Importa un archivo para ver su forma de onda"
+                    }}</span>
+                  </div>
+                  <div
+                    v-if="levels && hoverTime !== null"
+                    class="inspection-line"
+                    :style="{ left: `${percent(inspectionTime)}%` }"
+                  />
+                  <div
+                    v-if="inspectedLevel && hoverTime !== null"
+                    class="wave-tooltip"
+                    :style="{ left: `${tooltipLeft}px` }"
+                  >
+                    {{ time(inspectionTime) }} ·
+                    {{ dbLabel(inspectedLevel.peakDb) }} dBFS
+                  </div>
+                  <template v-if="duration && selectionValid"
+                    ><div
+                      class="wave-shade"
+                      :style="{ width: `${percent(startSeconds!)}%` }"
+                    />
+                    <div
+                      class="wave-shade right"
+                      :style="{ width: `${100 - percent(endSeconds!)}%` }"
+                    />
+                    <div
+                      class="wave-selection"
+                      :style="{
+                        left: `${percent(startSeconds!)}%`,
+                        width: `${percent(endSeconds! - startSeconds!)}%`,
+                      }"
+                    />
+                    <button
+                      class="trim-handle start"
+                      :style="{ left: `${percent(startSeconds!)}%` }"
+                      aria-label="Inicio de selección"
+                      title="Arrastrar inicio de selección"
+                      @pointerdown="dragHandle($event, 'start')"
+                    >
+                      <span /></button
+                    ><button
+                      class="trim-handle end"
+                      :style="{ left: `${percent(endSeconds!)}%` }"
+                      aria-label="Final de selección"
+                      title="Arrastrar final de selección"
+                      @pointerdown="dragHandle($event, 'end')"
+                    >
+                      <span />
+                    </button>
+                  </template>
+                  <template v-if="tool === 'split'"
+                    ><button
+                      v-for="(point, i) in splitMode === 'manual'
+                        ? markers
+                        : analyzedSegments
+                            .slice(1)
+                            .map((segment) => segment.startSeconds)"
+                      :key="point"
+                      class="cut-marker"
+                      :style="{ left: `${percent(point)}%` }"
+                      :title="`Corte ${i + 1}: ${time(point)}`"
+                      :aria-label="`Ir al corte ${i + 1}`"
+                      @pointerdown.stop="seek(point)"
+                    >
+                      {{ i + 1 }}
+                    </button></template
+                  >
+                  <div
+                    v-if="duration"
+                    class="playhead"
+                    :style="{ left: `${percent(cursor)}%` }"
+                  />
+                </div>
+              </div>
+              <div v-if="levelsError" class="inline-error" role="status">
+                {{ levelsError }}
+              </div>
+              <div
+                v-if="
+                  tool === 'split' && splitMode === 'silence' && inspectedLevel
+                "
+                class="signal-inspector"
+              >
+                <div class="signal-reading">
+                  <span class="signal-position"
+                    ><Activity :size="14" />{{ time(inspectionTime) }}</span
+                  ><span
+                    >Pico
+                    <strong
+                      >{{ dbLabel(inspectedLevel.peakDb) }}
+                      <small>dBFS</small></strong
+                    ></span
+                  ><span
+                    >RMS
+                    <strong
+                      >{{ dbLabel(inspectedLevel.rmsDb) }}
+                      <small>dBFS</small></strong
+                    ></span
+                  ><span :class="{ 'quiet-reading': inspectedSilence }">{{
+                    inspectedSilence
+                      ? `Pausa ≈ ${silenceDuration.toFixed(2)} s`
+                      : "Por encima del umbral"
+                  }}</span>
+                </div>
+                <div class="signal-actions">
+                  <button
+                    class="text-button"
+                    :disabled="suggestedThreshold === null"
+                    @click="thresholdDb = suggestedThreshold!"
+                  >
+                    Usar {{ suggestedThreshold }} dB de umbral
+                    <ArrowRight :size="12" /></button
+                  ><button
+                    v-if="inspectedSilence"
+                    class="text-button"
+                    @click="
+                      minSilence = Math.max(
+                        0.05,
+                        Math.min(
+                          60,
+                          Math.floor(silenceDuration * 0.8 * 100) / 100,
+                        ),
+                      )
+                    "
+                  >
+                    Usar pausa mínima de
+                    {{
+                      Math.max(
+                        0.05,
+                        Math.min(
+                          60,
+                          Math.floor(silenceDuration * 0.8 * 100) / 100,
+                        ),
+                      ).toFixed(2)
+                    }}
+                    s <ArrowRight :size="12" />
+                  </button>
+                </div>
+                <p>
+                  Mide una pausa para orientar el umbral. Mueve el puntero para
+                  medir; haz clic para fijar la posición. Ventanas de 20 ms,
+                  escala en dBFS. El umbral sugerido deja 3 dB sobre el pico
+                  medido; el autosplit confirma las pausas al analizar.
+                </p>
+              </div>
+              <div v-if="previewError" class="inline-error" role="status">
+                {{ previewError }} La exportación sigue disponible si el archivo
+                es válido.
+              </div>
+              <audio
+                v-if="audioUrl"
+                ref="audio"
+                :src="audioUrl"
+                preload="metadata"
+                @play="onAudioPlay"
+                @timeupdate="updateTime"
+                @ended="ended"
+                @pause="playing = false"
+                @error="
+                  previewError = 'No se pudo cargar el audio de preescucha.'
+                "
+              />
+              <div class="selection-fields">
+                <label
+                  >Inicio
+                  <input
+                    v-model="start"
+                    class="time-input"
+                    :disabled="!duration"
+                    aria-label="Tiempo de inicio"
+                    @change="stopPlayback"
+                  /><button
+                    class="text-button"
+                    :disabled="!duration"
+                    @click="
+                      start = time(
+                        Math.min(cursor, (endSeconds || duration) - 0.001),
+                      )
+                    "
+                  >
+                    Usar cursor <kbd>I</kbd>
+                  </button></label
+                ><ChevronRight :size="18" class="selection-arrow" /><label
+                  >Final
+                  <input
+                    v-model="end"
+                    class="time-input"
+                    :disabled="!duration"
+                    aria-label="Tiempo final"
+                  /><button
+                    class="text-button"
+                    :disabled="!duration"
+                    @click="
+                      end = time(Math.max(cursor, (startSeconds || 0) + 0.001))
+                    "
+                  >
+                    Usar cursor <kbd>O</kbd>
+                  </button></label
+                >
+                <div class="duration-info">
+                  <small>SELECCIÓN</small
+                  ><strong>{{ time(selectionDuration) }}</strong
+                  ><button
+                    class="text-button"
+                    :disabled="!duration"
+                    @click="resetSelection"
+                  >
+                    <RotateCcw :size="12" />Restablecer
+                  </button>
+                </div>
+              </div>
+              <div class="editor-hint">
+                <span>Segundos o mm:ss.mmm</span
+                ><span
+                  ><kbd>Espacio</kbd> reproducir · <kbd>←</kbd><kbd>→</kbd> 1 s
+                  · Shift 0.1 s</span
+                >
+              </div>
+              <div v-if="tool === 'trim'" class="fade-section">
+                <div class="fields-row">
+                  <label
+                    >Fade de entrada
+                    <div class="unit-input">
+                      <input
+                        v-model.number="fadeIn"
+                        type="number"
+                        min="0"
+                        :max="selectionDuration / 2"
+                        step="0.1"
+                      /><span>s</span>
+                    </div></label
+                  ><label
+                    >Fade de salida
+                    <div class="unit-input">
+                      <input
+                        v-model.number="fadeOut"
+                        type="number"
+                        min="0"
+                        :max="selectionDuration / 2"
+                        step="0.1"
+                      /><span>s</span>
+                    </div></label
+                  >
+                </div>
+                <p class="panel-footnote">
+                  Suaviza los bordes del recorte. Usa 0 para conservar el corte
+                  directo.
+                </p>
+              </div>
+              <template v-if="tool === 'split'">
+                <div class="split-section">
+                  <div class="split-mode-tabs" aria-label="Método de división">
+                    <button
+                      :class="{ active: splitMode === 'chapters' }"
+                      @click="splitMode = 'chapters'"
+                    >
+                      Por capítulos</button
+                    ><button
+                      :class="{ active: splitMode === 'silence' }"
+                      @click="splitMode = 'silence'"
+                    >
+                      Por silencios</button
+                    ><button
+                      :class="{ active: splitMode === 'manual' }"
+                      @click="splitMode = 'manual'"
+                    >
+                      Manual
+                    </button>
+                  </div>
+                  <p class="split-help">
+                    {{
+                      splitMode === "chapters"
+                        ? "Usa los capítulos incrustados en el archivo local. Si no hay capítulos, puedes elegir silencios o marcar tus propios cortes."
+                        : splitMode === "silence"
+                          ? "Detecta las pausas y coloca un corte en el centro de cada silencio que cumpla los parámetros."
+                          : "Haz doble clic en la onda, usa el cursor o escribe un tiempo exacto para añadir cada corte."
+                    }}
+                  </p>
+                  <div
+                    v-if="splitMode === 'silence'"
+                    class="fields-row silence-fields"
+                  >
+                    <label
+                      >Umbral
+                      <div class="unit-input">
+                        <input
+                          v-model.number="thresholdDb"
+                          type="number"
+                          min="-80"
+                          max="-5"
+                          step="1"
+                        /><span>dB</span>
+                      </div></label
+                    ><label
+                      >Pausa mínima
+                      <div class="unit-input">
+                        <input
+                          v-model.number="minSilence"
+                          type="number"
+                          min="0.05"
+                          max="60"
+                          step="0.1"
+                        /><span>s</span>
+                      </div></label
+                    ><label
+                      >Segmento mínimo
+                      <div class="unit-input">
+                        <input
+                          v-model.number="minSegment"
+                          type="number"
+                          min="0.001"
+                          step="1"
+                        /><span>s</span>
+                      </div></label
+                    >
+                  </div>
+                  <div v-if="splitMode === 'manual'" class="manual-tools">
+                    <button
+                      class="secondary-button compact"
+                      :disabled="!selectionValid"
+                      @click="addMarker()"
+                    >
+                      <Plus :size="15" />Corte en cursor <kbd>M</kbd>
+                    </button>
+                    <div class="marker-input">
+                      <input
+                        v-model="markerInput"
+                        placeholder="00:30.000"
+                        aria-label="Tiempo de nuevo corte"
+                        @keydown.enter="addTypedMarker"
+                      /><button
+                        class="icon-button"
+                        :disabled="!selectionValid || !markerInput"
+                        aria-label="Añadir corte con tiempo exacto"
+                        @click="addTypedMarker"
+                      >
+                        <Plus :size="16" />
+                      </button>
+                    </div>
+                  </div>
+                  <button
+                    v-else
+                    class="secondary-button analyze-button"
+                    :disabled="!selectionValid || analysisBusy"
+                    @click="analyze"
+                  >
+                    <LoaderCircle
+                      v-if="analysisBusy"
+                      :size="16"
+                      class="spin"
+                    /><Activity v-else :size="16" />{{
+                      analysisBusy
+                        ? "Analizando archivo…"
+                        : splitMode === "chapters"
+                          ? "Leer capítulos"
+                          : "Detectar silencios"
+                    }}
+                  </button>
+                  <button
+                    v-if="analysisBusy"
+                    class="text-button"
+                    @click="invalidateAnalysis"
+                  >
+                    Cancelar análisis
+                  </button>
+                  <div
+                    v-if="splitMode === 'manual' && markers.length"
+                    class="marker-chips"
+                  >
+                    <button
+                      v-for="point in markers"
+                      :key="point"
+                      :class="{ muted: !inRangeMarkers.includes(point) }"
+                      :title="
+                        inRangeMarkers.includes(point)
+                          ? 'Quitar corte'
+                          : 'Fuera de la selección · quitar corte'
+                      "
+                      @click="
+                        markers = markers.filter((marker) => marker !== point)
+                      "
+                    >
+                      {{ time(point) }}<X :size="12" />
+                    </button>
+                  </div>
+                </div>
+                <div
+                  v-if="
+                    segments.length &&
+                    (splitMode === 'manual' || analyzedSegments.length)
+                  "
+                  class="segment-review"
+                >
+                  <div class="section-top">
+                    <h3>
+                      {{ segments.length }} segmento(s)
+                      <small
+                        >·
+                        {{
+                          splitMode === "manual"
+                            ? "cortes manuales"
+                            : "revisión del autosplit"
+                        }}</small
+                      >
+                    </h3>
+                    <button
+                      v-if="splitMode !== 'manual' && segments.length > 1"
+                      class="text-button"
+                      @click="editDetectedCuts"
+                    >
+                      Ajustar manualmente
+                    </button>
+                  </div>
+                  <div class="segment-list">
+                    <div
+                      v-for="(segment, i) in segments"
+                      :key="segment.startSeconds"
+                      class="segment-row"
+                    >
+                      <span class="segment-number">{{
+                        String(i + 1).padStart(2, "0")
+                      }}</span
+                      ><span
+                        >{{ time(segment.startSeconds) }}
+                        <span class="muted">→</span>
+                        {{ time(segment.endSeconds) }}</span
+                      ><small>{{
+                        time(segment.endSeconds - segment.startSeconds)
+                      }}</small
+                      ><button
+                        class="icon-button"
+                        :disabled="!preview"
+                        :aria-label="`Escuchar segmento ${i + 1}`"
+                        title="Escuchar segmento"
+                        @click="
+                          playRegion(segment.startSeconds, segment.endSeconds)
+                        "
+                      >
+                        <Play :size="14" />
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              </template>
+            </template>
+          </section>
+
+          <aside class="export-panel panel">
+            <div class="section-top">
+              <div>
+                <span class="step-number">03</span>
+                <h2>Exportación</h2>
+              </div>
+            </div>
+            <div class="export-body">
+              <label
+                >Formato de salida<select v-model="format">
+                  <option v-for="value in formats" :key="value" :value="value">
+                    {{ value.toUpperCase()
+                    }}{{
+                      value === "wav"
+                        ? " · PCM 16 bits"
+                        : value === "mp3"
+                          ? " · 320 kbps"
+                          : value === "flac"
+                            ? " · sin pérdida"
+                            : ""
+                    }}
+                  </option>
+                </select></label
+              ><label
+                >Destino<select v-model="destination">
+                  <option value="source">Junto al archivo original</option>
+                  <option value="custom">Carpeta personalizada</option>
+                </select></label
+              ><button
+                v-if="destination === 'custom'"
+                class="folder-picker"
+                @click="chooseDestination"
+              >
+                <FolderOpen :size="17" /><span :title="outputDir">{{
+                  outputDir || "Seleccionar carpeta"
+                }}</span>
+              </button>
+              <div class="export-summary">
+                <div>
+                  <span>{{
+                    tool === "normalize" ? "Archivos" : "Archivo seleccionado"
+                  }}</span
+                  ><strong>{{
+                    tool === "normalize"
+                      ? sources.length
+                      : selected?.probe
+                        ? "1"
+                        : "—"
+                  }}</strong>
+                </div>
+                <div>
+                  <span>{{
+                    tool === "normalize" ? "Objetivo" : "Duración"
+                  }}</span
+                  ><strong>{{
+                    tool === "normalize"
+                      ? `${loudness} LUFS`
+                      : time(selectionDuration)
+                  }}</strong>
+                </div>
+                <div v-if="tool === 'split'">
+                  <span>Archivos de salida</span
+                  ><strong>{{
+                    autoReviewed && segments.length > 1
+                      ? segments.length
+                      : "Por revisar"
+                  }}</strong>
+                </div>
+                <div v-if="tool === 'normalize'">
+                  <span>True peak</span><strong>{{ truePeak }} dBTP</strong>
+                </div>
+              </div>
+              <div class="original-note">
+                <Check :size="16" />
+                <p>
+                  Los originales se conservan. Cada exportación recibe un nombre
+                  disponible.
+                </p>
+              </div>
+              <button
+                class="primary-button"
+                :disabled="!!exportProblem || analysisBusy"
+                @click="exportJobs"
+              >
+                {{
+                  tool === "split"
+                    ? "Exportar segmentos"
+                    : tool === "normalize"
+                      ? "Normalizar archivos"
+                      : "Exportar recorte"
+                }}<ArrowRight :size="17" />
+              </button>
+              <p class="export-validation" role="status">
+                {{ exportProblem || "Todo listo para exportar." }}
+              </p>
+            </div>
+          </aside>
+        </div>
+      </template>
+      <div v-if="error" class="error-banner" role="alert">
+        <span>{{ error }}</span
+        ><button
+          class="icon-button"
+          aria-label="Cerrar error"
+          @click="error = ''"
+        >
+          <X :size="16" />
+        </button>
+      </div>
+    </div>
+    <div v-if="dragging" class="drop-overlay">
+      <Upload :size="38" />
+      <h2>Suelta tus archivos para importarlos</h2>
+    </div>
+  </div>
+</template>
