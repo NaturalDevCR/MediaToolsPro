@@ -5,6 +5,7 @@ import {
   validOutputNamePattern,
   type SplitPreset,
 } from "../src/lib/split-presets.ts";
+import { compatibleEncoding } from "../src/lib/export-options.ts";
 
 test("saved Split settings round-trip and unreadable entries are ignored", () => {
   const preset: SplitPreset = {
@@ -36,4 +37,14 @@ test("split export names stay in the destination and require a segment number", 
   for (const pattern of ["../{numero}", "a\\{numero}", "{archivo}", "{numero}_{otro}", "a\u0000{numero}"]) {
     assert.equal(validOutputNamePattern(pattern), false, pattern);
   }
+});
+
+test("a preset uses only the options supported by the selected format", () => {
+  const requested = { sampleRate: 96000, channels: 2, pcmBitDepth: 24, audioBitrateKbps: 160 };
+  assert.deepEqual(compatibleEncoding("aiff", requested), {
+    sampleRate: 96000, channels: 2, pcmBitDepth: 24,
+  });
+  assert.deepEqual(compatibleEncoding("opus", requested), {
+    channels: 2, audioBitrateKbps: 160,
+  });
 });

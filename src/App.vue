@@ -7,6 +7,7 @@ import Footer from "./components/layout/Footer.vue";
 import Studio from "./views/Studio.vue";
 import Settings from "./views/Settings.vue";
 import Logs from "./views/Logs.vue";
+import { locale, t } from "./lib/i18n";
 import { addLog, type LogEntry } from "./stores/logs";
 import { disposeStudio, initStudio } from "./stores/studio";
 const currentTab = ref("tools");
@@ -26,6 +27,9 @@ watch(
   },
   { immediate: true },
 );
+watch(locale, () => {
+  document.title = `MediaToolsPro · ${t("Estudio")}`;
+}, { immediate: true });
 onMounted(async () => {
   addLog("Estudio iniciado", "success");
   if (!isTauri()) return;

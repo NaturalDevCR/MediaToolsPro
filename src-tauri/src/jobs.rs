@@ -119,8 +119,12 @@ pub fn media_kind_for_format(format: &str) -> &'static str {
 pub fn is_audio_format(format: &str) -> bool {
     matches!(
         format,
-        "mp3" | "wav" | "flac" | "m4a" | "aac" | "ogg" | "opus"
+        "mp3" | "wav" | "aiff" | "flac" | "m4a" | "aac" | "ogg" | "opus"
     )
+}
+
+pub fn is_video_format(format: &str) -> bool {
+    matches!(format, "mp4" | "mov" | "mkv" | "webm")
 }
 
 #[tauri::command]

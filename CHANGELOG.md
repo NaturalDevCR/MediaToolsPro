@@ -1,5 +1,12 @@
 # Historial de cambios
 
+## 0.5.0 — 2026-11-23
+
+- Detección de pausas adaptada a los niveles del audio, con sensibilidad y análisis automático opcional.
+- Zoom por segundos y salto a un punto de la forma de onda en grabaciones largas.
+- Exportación AIFF, AAC y MOV y opciones de codificación según el formato.
+- Interfaz en español e inglés con selector de idioma.
+
 ## 0.4.2 — 2026-11-23
 
 - El instalador de macOS sella la app completa con una firma ad hoc.

@@ -35,6 +35,9 @@ import {
 } from "lucide-vue-next";
 import QueueItem from "../components/QueueItem.vue";
 import SplitComparisonPlayer from "../components/SplitComparisonPlayer.vue";
+import ExportOptions from "../components/ExportOptions.vue";
+import { compatibleEncoding } from "../lib/export-options";
+import { t, tMediaMessage } from "../lib/i18n";
 import {
   basename,
   cancelItem,
@@ -47,22 +50,32 @@ import {
   revealOutput,
 } from "../stores/studio";
 import type {
+  AutomaticSilence,
+  ExportEncoding,
   MediaProbeResponse,
   ProcessJobRequest,
   Segment,
+  SilenceSensitivity,
   SplitComparison,
   SplitMode,
   SplitNormalization,
+  SplitPlan,
   Tool,
   WaveformPreviewResponse,
   WaveformLevelsResponse,
 } from "../types/jobs";
 
 import {
+  createWaveformEnvelope,
   dbHeight,
   inspectLevel,
   quietRegions,
   suggestThreshold,
+  waveformRulerTicks,
+  waveformScrollOffset,
+  waveformTrackWidth,
+  waveformVisibleRange,
+  waveformZoomSpans,
 } from "../lib/waveform";
 import {
   audioFormats,
@@ -128,13 +141,42 @@ const hoverTime = ref<number | null>(null);
 const lastInspectedTime = ref<number | null>(null);
 const scrollOffset = ref(0);
 const viewportWidth = ref(0);
+const zoomSpan = ref<number>();
+const jumpTime = ref("");
+const jumpInvalid = ref(false);
+const zoomSpans = computed(() =>
+  waveformZoomSpans(duration.value, viewportWidth.value),
+);
+const activeZoom = computed({
+  get: () => {
+    const requested = zoomSpan.value ?? duration.value;
+    const spans = zoomSpans.value;
+    return spans.find((span) => span <= requested) ?? spans[spans.length - 1];
+  },
+  set: (span: number) => void changeZoom(span),
+});
+const zoomIndex = computed(() => zoomSpans.value.indexOf(activeZoom.value));
+const trackWidth = computed(() =>
+  waveformTrackWidth(duration.value, activeZoom.value, viewportWidth.value),
+);
+const visibleRange = computed(() =>
+  waveformVisibleRange(
+    duration.value,
+    trackWidth.value,
+    viewportWidth.value,
+    scrollOffset.value,
+  ),
+);
+const envelope = computed(() => levels.value && createWaveformEnvelope(levels.value));
 let levelsToken = 0;
 let levelsId = "";
 let resizeObserver: ResizeObserver | undefined;
 let paintFrame = 0;
 const quiet = computed(() =>
-  levels.value
-    ? quietRegions(levels.value, thresholdDb.value, duration.value)
+  automaticAnalysis.value
+    ? automaticAnalysis.value.pauses
+    : levels.value
+    ? quietRegions(levels.value, effectiveThreshold.value, duration.value)
     : [],
 );
 const inspectionTime = computed(
@@ -174,26 +216,17 @@ const tooltipLeft = computed(
     ),
 );
 const rulerTicks = computed(() => {
-  if (!duration.value || !viewportWidth.value)
-    return [{ seconds: 0, label: "00:00" }];
-  const ideal = duration.value / zoom.value / 5;
-  const power = 10 ** Math.floor(Math.log10(ideal));
-  const step = [1, 2, 5, 10].find((value) => value * power >= ideal)! * power;
-  const from =
-    (scrollOffset.value / (viewportWidth.value * zoom.value)) * duration.value;
-  const to = Math.min(duration.value, from + duration.value / zoom.value);
-  const ticks = [];
-  for (
-    let value = Math.ceil(from / step) * step;
-    value <= to + 0.000001;
-    value += step
-  ) {
-    ticks.push({
-      seconds: value,
-      label: step < 1 ? time(value) : time(value).replace(/\.\d+$/, ""),
-    });
-  }
-  return ticks;
+  if (!duration.value || !viewportWidth.value) return [{ seconds: 0, label: "00:00" }];
+  const { startSeconds, endSeconds } = visibleRange.value;
+  const { step, seconds } = waveformRulerTicks(
+    startSeconds,
+    endSeconds,
+    viewportWidth.value,
+  );
+  return seconds.map((value) => ({
+    seconds: value,
+    label: step < 1 ? time(value) : time(value).replace(/\.\d+$/, ""),
+  }));
 });
 
 function dbLabel(db: number) {
@@ -205,43 +238,49 @@ function schedulePaint() {
 }
 function waveScrolled() {
   scrollOffset.value = waveScroll.value?.scrollLeft || 0;
+  hoverTime.value = null;
   schedulePaint();
 }
 function paintWaveform() {
   const canvas = waveCanvas.value;
   const scroll = waveScroll.value;
   const track = timeline.value;
-  if (
-    !canvas ||
-    !scroll ||
-    !track ||
-    !levels.value ||
-    !duration.value ||
-    !scroll.clientWidth
-  )
-    return;
+  if (!scroll?.clientWidth || !track) return;
   const width = scroll.clientWidth;
+  if (width !== viewportWidth.value) {
+    const oldWidth = viewportWidth.value;
+    const focus = waveFocus(oldWidth, track.clientWidth, scrollOffset.value);
+    viewportWidth.value = width;
+    void nextTick(() => {
+      if (oldWidth) scrollWaveTo(focus.seconds, (focus.screenX / oldWidth) * width);
+      else waveScrolled();
+    });
+    return;
+  }
+  const measure = envelope.value;
+  if (!canvas || !duration.value || !measure) return;
   const height = track.clientHeight - 30;
   const ratio = Math.min(2, window.devicePixelRatio || 1);
-  viewportWidth.value = width;
-  scrollOffset.value = scroll.scrollLeft;
-  canvas.width = Math.round(width * ratio);
-  canvas.height = Math.round(height * ratio);
+  const offset = scroll.scrollLeft;
+  scrollOffset.value = offset;
+  const pixelWidth = Math.round(width * ratio);
+  const pixelHeight = Math.round(height * ratio);
+  if (canvas.width !== pixelWidth) canvas.width = pixelWidth;
+  if (canvas.height !== pixelHeight) canvas.height = pixelHeight;
   canvas.style.width = `${width}px`;
   canvas.style.height = `${height}px`;
-  canvas.style.left = `${scroll.scrollLeft}px`;
+  canvas.style.left = `${offset}px`;
   const ctx = canvas.getContext("2d");
   if (!ctx) return;
-  ctx.scale(ratio, ratio);
+  ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+  ctx.clearRect(0, 0, width, height);
   const center = height / 2;
   const half = center - 8;
-  const data = levels.value;
-  const samplesPerPixel = data.peaksDb.length / track.clientWidth;
-  const offset = scroll.scrollLeft;
-  if (tool.value === "split" && splitMode.value === "silence") {
+  const secondsPerPixel = duration.value / track.clientWidth;
+  if (tool.value === "split" && usesPauses.value) {
     ctx.fillStyle = "#d6ad5d15";
     for (const region of quiet.value) {
-      if (region.endSeconds - region.startSeconds < minSilence.value) continue;
+      if (region.endSeconds - region.startSeconds < minimumVisiblePause.value) continue;
       const left =
         (region.startSeconds / duration.value) * track.clientWidth - offset;
       const right =
@@ -255,31 +294,29 @@ function paintWaveform() {
         );
     }
   }
+  const peaks = new Path2D();
+  const rms = new Path2D();
   for (let x = 0; x < width; x++) {
-    const first = Math.floor((offset + x) * samplesPerPixel);
-    const last = Math.min(
-      data.peaksDb.length,
-      Math.max(first + 1, Math.ceil((offset + x + 1) * samplesPerPixel)),
+    const { peakDb, rmsDb } = measure(
+      (offset + x) * secondsPerPixel,
+      (offset + x + 1) * secondsPerPixel,
     );
-    let peak = -120;
-    let rms = -120;
-    for (let i = first; i < last; i++) {
-      peak = Math.max(peak, data.peaksDb[i]);
-      rms = Math.max(rms, data.rmsDb[i]);
-    }
-    const amplitude = Math.max(0.5, dbHeight(peak) * half);
-    ctx.fillStyle = "#4b9c7e";
-    ctx.fillRect(x, center - amplitude, 1, amplitude * 2);
-    const body = Math.max(0.3, dbHeight(rms) * half);
-    ctx.fillStyle = "#93d8b4";
-    ctx.fillRect(x, center - body, 1, body * 2);
+    const amplitude = Math.max(0.5, dbHeight(peakDb) * half);
+    const body = Math.max(0.3, dbHeight(rmsDb) * half);
+    peaks.rect(x, center - amplitude, 1, amplitude * 2);
+    rms.rect(x, center - body, 1, body * 2);
   }
+  ctx.fillStyle = "#4b9c7e";
+  ctx.fill(peaks);
+  ctx.fillStyle = "#93d8b4";
+  ctx.fill(rms);
   if (
     tool.value === "split" &&
-    splitMode.value === "silence" &&
-    Number.isFinite(thresholdDb.value)
+    usesPauses.value &&
+    (!autoSilence.value || automaticAnalysis.value) &&
+    Number.isFinite(effectiveThreshold.value)
   ) {
-    const h = dbHeight(thresholdDb.value) * half;
+    const h = dbHeight(effectiveThreshold.value) * half;
     ctx.strokeStyle = "#ecc681bb";
     ctx.setLineDash([4, 4]);
     ctx.beginPath();
@@ -291,29 +328,53 @@ function paintWaveform() {
     ctx.setLineDash([]);
     ctx.font = "9px ui-monospace, monospace";
     ctx.fillStyle = "#ecc681";
-    ctx.fillText(`${thresholdDb.value} dBFS`, 8, Math.max(12, center - h - 5));
+    ctx.fillText(`${effectiveThreshold.value} dBFS`, 8, Math.max(12, center - h - 5));
   }
 }
-async function changeZoom(value: number) {
+function waveFocus(width: number, track: number, offset: number) {
+  if (!width || !track || !duration.value)
+    return { seconds: cursor.value, screenX: 0 };
+  const cursorX = (cursor.value / duration.value) * track - offset;
+  if (cursorX >= 0 && cursorX <= width)
+    return { seconds: cursor.value, screenX: cursorX };
+  const screenX = width / 2;
+  return { seconds: ((offset + screenX) / track) * duration.value, screenX };
+}
+function scrollWaveTo(seconds: number, screenX: number) {
   const scroll = waveScroll.value;
   const track = timeline.value;
-  let focusTime = cursor.value;
-  let screenX = scroll ? scroll.clientWidth / 2 : 0;
-  if (scroll && track && duration.value) {
-    const cursorX =
-      (cursor.value / duration.value) * track.clientWidth - scroll.scrollLeft;
-    if (cursorX >= 0 && cursorX <= scroll.clientWidth) screenX = cursorX;
-    else
-      focusTime =
-        ((scroll.scrollLeft + screenX) / track.clientWidth) * duration.value;
-  }
-  zoom.value = Math.max(1, Math.min(64, value));
-  hoverTime.value = null;
-  await nextTick();
-  if (scroll && timeline.value && duration.value)
-    scroll.scrollLeft =
-      (focusTime / duration.value) * timeline.value.clientWidth - screenX;
+  if (!scroll || !track) return;
+  scroll.scrollLeft = waveformScrollOffset(
+    seconds,
+    screenX,
+    duration.value,
+    track.clientWidth,
+    scroll.clientWidth,
+  );
   waveScrolled();
+}
+async function changeZoom(span: number) {
+  const scroll = waveScroll.value;
+  const track = timeline.value;
+  if (!scroll || !track || !zoomSpans.value.includes(span)) return;
+  const focus = waveFocus(scroll.clientWidth, track.clientWidth, scroll.scrollLeft);
+  zoomSpan.value = span === duration.value ? undefined : span;
+  await nextTick();
+  scrollWaveTo(focus.seconds, focus.screenX);
+}
+function zoomLabel(span: number) {
+  if (span === duration.value) return t("Vista completa");
+  if (span >= 3600 && span % 3600 === 0) return `${span / 3600} h`;
+  if (span >= 60 && span % 60 === 0) return `${span / 60} min`;
+  return `${Number(span.toFixed(span < 1 ? 3 : 1))} s`;
+}
+function jumpToTime() {
+  const seconds = parse(jumpTime.value.replace(",", "."));
+  jumpInvalid.value = seconds === null || seconds > duration.value + 0.0005;
+  if (jumpInvalid.value || seconds === null) return;
+  seek(seconds);
+  jumpTime.value = time(cursor.value);
+  scrollWaveTo(cursor.value, (waveScroll.value?.clientWidth || 0) / 2);
 }
 async function cancelLevels() {
   levelsToken++;
@@ -356,7 +417,6 @@ async function loadLevels(path: string) {
 const cursor = ref(0);
 const playing = ref(false);
 const loop = ref(false);
-const zoom = ref(1);
 const start = ref("00:00.000");
 const end = ref("");
 const trimFades = ref({ in: 0, out: 0 });
@@ -364,12 +424,25 @@ const splitFades = ref({ in: 0, out: 0 });
 const fades = computed(() =>
   tool.value === "split" ? splitFades.value : trimFades.value,
 );
-const splitMode = ref<Exclude<SplitMode, "none">>("chapters");
+const splitMode = ref<Exclude<SplitMode, "none">>("silence");
 const splitDuration = ref("03:00");
 const splitDurationSeconds = computed(() => parse(splitDuration.value));
 const snapToPause = ref(false);
 const pauseWindow = ref(5);
 const snapMinSilence = ref(0.3);
+const autoSilence = ref(true);
+const scanAutomatically = ref(false);
+const silenceSensitivity = ref<SilenceSensitivity>("balanced");
+const automaticAnalysis = ref<AutomaticSilence>();
+const splitOptions = ref<HTMLElement>();
+const usesPauses = computed(() =>
+  splitMode.value === "silence" || (splitMode.value === "duration" && snapToPause.value),
+);
+const effectiveThreshold = computed(() => automaticAnalysis.value?.thresholdDb ?? thresholdDb.value);
+const minimumVisiblePause = computed(() =>
+  automaticAnalysis.value ? 0 : splitMode.value === "duration" ? snapMinSilence.value : minSilence.value,
+);
+let analysisTimer: ReturnType<typeof setTimeout> | undefined;
 const outputNamePattern = ref("");
 const storedPresets = ref(parseSplitPresets(localStorage.getItem(splitPresetsKey)));
 const presetChoice = ref("");
@@ -423,6 +496,11 @@ const minSegment = ref(20);
 const analysisBusy = ref(false);
 const analyzedSegments = ref<Segment[]>([]);
 const format = ref("wav");
+const encodingByFormat = ref<Record<string, ExportEncoding>>({});
+const currentEncoding = computed({
+  get: () => encodingByFormat.value[format.value] ?? {},
+  set: (encoding: ExportEncoding) => { encodingByFormat.value[format.value] = encoding; },
+});
 const destination = ref("source");
 const outputDir = ref("");
 const loudness = ref(-16);
@@ -608,7 +686,7 @@ async function chooseFiles() {
   try {
     const paths = await open({
       multiple: true,
-      filters: [{ name: "Audio y video", extensions }],
+      filters: [{ name: t("Audio y video"), extensions }],
     });
     if (paths) await addSources(Array.isArray(paths) ? paths : [paths]);
   } catch (e) {
@@ -665,7 +743,7 @@ async function playRegion(regionStart: number, regionEnd: number) {
     await audio.value.play();
     playing.value = true;
   } catch (e) {
-    previewError.value = `No se pudo reproducir la preescucha: ${String(e)}`;
+    previewError.value = t("No se pudo reproducir la preescucha: {error}", { error: String(e) });
   }
 }
 let animationFrame = 0;
@@ -784,6 +862,7 @@ function baseRequest(path: string): ProcessJobRequest {
     inputPath: path,
     outputDir: destination.value === "custom" ? outputDir.value : undefined,
     format: format.value,
+    encoding: compatibleEncoding(format.value, currentEncoding.value),
     trimStart:
       tool.value === "normalize" ? undefined : String(startSeconds.value),
     trimEnd: tool.value === "normalize" ? undefined : String(endSeconds.value),
@@ -801,9 +880,12 @@ function baseRequest(path: string): ProcessJobRequest {
     splitNormalization: isSplit ? splitNormalization.value : "none",
     manualMarkers: [],
     silence: {
-      thresholdDb: useSilence || usePauses ? thresholdDb.value : -35,
-      minSilenceDuration: usePauses ? snapMinSilence.value : useSilence ? minSilence.value : 1.5,
+      thresholdDb: !autoSilence.value && (useSilence || usePauses) ? thresholdDb.value : -35,
+      minSilenceDuration: !autoSilence.value && usePauses ? snapMinSilence.value
+        : !autoSilence.value && useSilence ? minSilence.value : 1.5,
       minSegmentDuration: useSilence ? minSegment.value : 20,
+      automatic: (useSilence || usePauses) && autoSilence.value,
+      sensitivity: silenceSensitivity.value,
     },
     fadeInDuration: normalize ? 0 : fades.value.in,
     fadeOutDuration: normalize ? 0 : fades.value.out,
@@ -820,6 +902,9 @@ function applySplitPreset() {
   snapToPause.value = preset.snapToPause;
   pauseWindow.value = preset.pauseWindow;
   snapMinSilence.value = preset.snapMinSilence;
+  autoSilence.value = preset.autoSilence ?? false;
+  silenceSensitivity.value = preset.sensitivity ?? "balanced";
+  scanAutomatically.value = preset.scanAutomatically ?? false;
   thresholdDb.value = preset.thresholdDb;
   minSilence.value = preset.minSilence;
   minSegment.value = preset.minSegment;
@@ -830,9 +915,13 @@ function applySplitPreset() {
   outputNamePattern.value = preset.outputNamePattern;
   const compatible = !selected.value?.probe || formats.value.includes(preset.format);
   format.value = compatible ? preset.format : "wav";
-  presetStatus.value = compatible
-    ? `Aplicado: ${preset.name}.`
-    : `Aplicado: ${preset.name}. Se usará WAV para este archivo.`;
+  currentEncoding.value = compatible
+    ? compatibleEncoding(preset.format, preset.encoding ?? {})
+    : {};
+  presetStatus.value = t(
+    compatible ? "Aplicado: {name}." : "Aplicado: {name}. Se usará WAV para este archivo.",
+    { name: preset.name },
+  );
 }
 
 function persistSplitPresets(presets: SplitPreset[]) {
@@ -860,6 +949,9 @@ function saveSplitPreset() {
     snapToPause: snapToPause.value,
     pauseWindow: pauseWindow.value,
     snapMinSilence: snapMinSilence.value,
+    autoSilence: autoSilence.value,
+    sensitivity: silenceSensitivity.value,
+    scanAutomatically: scanAutomatically.value,
     thresholdDb: thresholdDb.value,
     minSilence: minSilence.value,
     minSegment: minSegment.value,
@@ -869,6 +961,7 @@ function saveSplitPreset() {
     loudness: loudness.value,
     truePeak: truePeak.value,
     format: format.value,
+    encoding: compatibleEncoding(format.value, currentEncoding.value),
     outputNamePattern: outputNamePattern.value.trim(),
   };
   if (!isSplitPreset(preset)) {
@@ -880,7 +973,7 @@ function saveSplitPreset() {
     : [...storedPresets.value, preset];
   if (persistSplitPresets(next)) {
     presetChoice.value = id;
-    presetStatus.value = `Guardado: ${preset.name}.`;
+    presetStatus.value = t("Guardado: {name}.", { name: preset.name });
   }
 }
 
@@ -897,6 +990,7 @@ function splitRequest(path: string, splitSegments: Segment[]) {
   request.splitMode = "manual";
   request.splitDurationSeconds = undefined;
   request.splitPauseWindowSeconds = undefined;
+  request.silence.automatic = false;
   request.manualMarkers = splitSegments.slice(1).map(({ startSeconds }) => startSeconds);
   return request;
 }
@@ -948,8 +1042,10 @@ async function compareSegment(segment: Segment, index: number) {
   }
 }
 async function invalidateAnalysis() {
+  clearTimeout(analysisTimer);
   analysisToken++;
   analyzedSegments.value = [];
+  automaticAnalysis.value = undefined;
   analysisBusy.value = false;
   if (analysisId) {
     const id = analysisId;
@@ -962,7 +1058,7 @@ async function invalidateAnalysis() {
   }
 }
 async function analyze() {
-  if (!selectionValid.value || !selectedPath.value) return;
+  if (!isTauri() || !selectionValid.value || !selectedPath.value || tool.value !== "split") return;
   if (durationSplitProblem.value) {
     error.value = durationSplitProblem.value;
     return;
@@ -974,12 +1070,13 @@ async function analyze() {
   analysisBusy.value = true;
   error.value = "";
   try {
-    const result = await invoke<Segment[]>("preview_segments", {
+    const result = await invoke<SplitPlan>("analyze_split", {
       request: {
         ...baseRequest(selectedPath.value),
         id,
         splitNormalization: "none",
         outputNamePattern: undefined,
+        encoding: undefined,
         loudnessTargetLufs: -16,
         truePeakDbtp: -1.5,
         fadeInDuration: 0,
@@ -987,10 +1084,11 @@ async function analyze() {
       },
     });
     if (token !== analysisToken || disposed) return;
-    analyzedSegments.value = result;
-    if (result.length < 2)
+    analyzedSegments.value = result.segments;
+    automaticAnalysis.value = result.automatic ?? undefined;
+    if (result.segments.length < 2)
       error.value =
-        "No se encontraron silencios que cumplan estos parámetros. Ajusta el umbral, la pausa mínima o la duración mínima de segmento.";
+        "No se encontraron pausas para cortar. Prueba otra sensibilidad, reduce el segmento mínimo o añade cortes manuales.";
   } catch (e) {
     if (token === analysisToken && !disposed) error.value = String(e);
   } finally {
@@ -998,6 +1096,15 @@ async function analyze() {
       analysisBusy.value = false;
       analysisId = "";
     }
+  }
+}
+
+function scheduleAutomaticAnalysis() {
+  void invalidateAnalysis();
+  if (isTauri() && tool.value === "split" && usesPauses.value && scanAutomatically.value &&
+      selectionValid.value && !durationSplitProblem.value &&
+      (!autoSilence.value || !levelsBusy.value)) {
+    analysisTimer = setTimeout(() => void analyze(), 450);
   }
 }
 function editDetectedCuts() {
@@ -1029,7 +1136,7 @@ function exportJobs() {
       ? splitRequest(path, segments.value)
       : baseRequest(path));
     enqueue(requests, tool.value);
-    notice.value = `${requests.length} tarea(s) añadida(s) a la cola.`;
+    notice.value = t("{count} tarea(s) añadida(s) a la cola.", { count: requests.length });
     showQueue.value = true;
   } catch (e) {
     error.value = String(e);
@@ -1123,7 +1230,11 @@ watch(selectedPath, async (path) => {
   start.value = time(0);
   end.value = duration.value ? time(duration.value) : "";
   markers.value = [];
-  zoom.value = 1;
+  zoomSpan.value = undefined;
+  jumpTime.value = "";
+  jumpInvalid.value = false;
+  scrollOffset.value = 0;
+  if (waveScroll.value) waveScroll.value.scrollLeft = 0;
   if (!path) {
     previewBusy.value = false;
     return;
@@ -1139,9 +1250,17 @@ watch(duration, (value) => {
   end.value = value ? time(value) : "";
 });
 watch(
-  [start, end, splitMode, splitDuration, snapToPause, pauseWindow, snapMinSilence, thresholdDb, minSilence, minSegment],
-  () => void invalidateAnalysis(),
+  [tool, selectedPath, start, end, splitMode, splitDuration, snapToPause, pauseWindow, snapMinSilence,
+    autoSilence, scanAutomatically, silenceSensitivity, thresholdDb, minSilence, minSegment],
+  scheduleAutomaticAnalysis,
 );
+watch([automaticAnalysis, autoSilence, snapToPause, snapMinSilence], schedulePaint);
+watch(levelsBusy, (busy) => {
+  if (!busy && autoSilence.value && scanAutomatically.value && usesPauses.value &&
+      !analysisBusy.value && !analyzedSegments.value.length) {
+    scheduleAutomaticAnalysis();
+  }
+});
 watch([start, end], stopPlayback);
 watch(showQueue, (value) => {
   if (value) {
@@ -1170,7 +1289,7 @@ watch(
 watch(
   [
     levels,
-    zoom,
+    zoomSpan,
     thresholdDb,
     minSilence,
     tool,
@@ -1241,7 +1360,7 @@ onUnmounted(() => {
 <template>
   <div class="studio" :class="{ 'drop-active': dragging }">
     <aside class="studio-sidebar">
-      <div class="sidebar-label">ESTUDIO LOCAL</div>
+      <div class="sidebar-label">{{ t('ESTUDIO LOCAL') }}</div>
       <button
         v-for="item in tools"
         :key="item.id"
@@ -1256,26 +1375,26 @@ onUnmounted(() => {
       >
         <component :is="item.icon" :size="20" /><span
           ><strong>{{ item.name }}</strong
-          ><small>{{ item.hint }}</small></span
+          ><small>{{ t(item.hint) }}</small></span
         ><ChevronRight v-if="tool === item.id && !showQueue" :size="15" />
       </button>
       <div class="sidebar-divider" />
       <button
         class="tool-nav queue-nav"
-        aria-label="Exportaciones"
-        title="Exportaciones"
+        :aria-label="t('Exportaciones')"
+        :title="t('Exportaciones')"
         :class="{ active: showQueue }"
         @click="showQueue = true"
       >
         <ListOrdered :size="20" /><span
-          ><strong>Exportaciones</strong
-          ><small>Progreso e historial</small></span
+          ><strong>{{ t('Exportaciones') }}</strong
+          ><small>{{ t('Progreso e historial') }}</small></span
         ><span v-if="pendingCount" class="count">{{ pendingCount }}</span>
       </button>
       <div class="sidebar-bottom">
         <span class="status-dot" /><span
-          >Tu archivo. Tu equipo.<br /><small
-            >Procesamiento local con FFmpeg</small
+          >{{ t('Tu archivo. Tu equipo.') }}<br /><small
+            >{{ t('Procesamiento local con FFmpeg') }}</small
           ></span
         >
       </div>
@@ -1285,13 +1404,13 @@ onUnmounted(() => {
       <template v-if="showQueue">
         <div class="workspace-heading">
           <div>
-            <div class="eyebrow">ESPACIO DE TRABAJO / COLA</div>
-            <h1>Exportaciones<span>.</span></h1>
+            <div class="eyebrow">{{ t('ESPACIO DE TRABAJO / COLA') }}</div>
+            <h1>{{ t('Exportaciones') }}<span>.</span></h1>
             <p>
               {{
                 pendingCount
-                  ? `${pendingCount} tarea(s) en curso o en espera.`
-                  : "Tus resultados, en un solo lugar."
+                  ? t('{count} tarea(s) en curso o en espera.', { count: pendingCount })
+                  : t('Tus resultados, en un solo lugar.')
               }}
             </p>
           </div>
@@ -1304,14 +1423,14 @@ onUnmounted(() => {
             "
             @click="clearHistory"
           >
-            Limpiar historial
+            {{ t('Limpiar historial') }}
           </button>
         </div>
         <div v-if="notice" class="notice" role="status">
           <Check :size="16" />{{ notice
           }}<button
             class="icon-button"
-            aria-label="Cerrar aviso"
+            :aria-label="t('Cerrar aviso')"
             @click="notice = ''"
           >
             <X :size="15" />
@@ -1319,10 +1438,10 @@ onUnmounted(() => {
         </div>
         <div v-if="!queue.length" class="empty-queue panel">
           <Layers :size="36" />
-          <h2>Lista para tu primera exportación</h2>
-          <p>Prepara un recorte, divide un archivo o normaliza tu audio.</p>
+          <h2>{{ t('Lista para tu primera exportación') }}</h2>
+          <p>{{ t('Prepara un recorte, divide un archivo o normaliza tu audio.') }}</p>
           <button class="secondary-button" @click="showQueue = false">
-            Volver al estudio <ArrowRight :size="16" />
+            {{ t('Volver al estudio') }} <ArrowRight :size="16" />
           </button>
         </div>
         <div v-else class="queue-list">
@@ -1341,24 +1460,23 @@ onUnmounted(() => {
         <div class="workspace-heading">
           <div>
             <div class="eyebrow">
-              ESPACIO DE TRABAJO / {{ tool.toUpperCase() }}
+              {{ t('ESPACIO DE TRABAJO /') }} {{ tool.toUpperCase() }}
             </div>
             <h1>{{ currentTool.name }}<span>.</span></h1>
-            <p>{{ currentTool.description }}</p>
+            <p>{{ t(currentTool.description) }}</p>
           </div>
           <span class="local-badge"
-            ><span class="status-dot" />ARCHIVOS LOCALES</span
+            ><span class="status-dot" />{{ t('ARCHIVOS LOCALES') }}</span
           >
         </div>
         <div v-if="!isTauri()" class="notice">
-          La interfaz está en modo navegador. Abre MediaToolsPro en escritorio
-          para importar y procesar archivos.
+          {{ t('La interfaz está en modo navegador. Abre MediaToolsPro en escritorio para importar y procesar archivos.') }}
         </div>
         <div class="source-panel panel">
           <div class="section-top">
             <div>
               <span class="step-number">01</span>
-              <h2>Archivos de origen</h2>
+              <h2>{{ t('Archivos de origen') }}</h2>
               <span v-if="sources.length" class="tag">{{
                 sources.length
               }}</span>
@@ -1368,7 +1486,7 @@ onUnmounted(() => {
               :disabled="!isTauri()"
               @click="chooseFiles"
             >
-              <Plus :size="15" />Añadir archivos
+              <Plus :size="15" />{{ t('Añadir archivos') }}
             </button>
           </div>
           <button
@@ -1378,9 +1496,9 @@ onUnmounted(() => {
             @click="chooseFiles"
           >
             <span class="upload-icon"><Upload :size="24" /></span
-            ><strong>Arrastra tus archivos aquí</strong
-            ><span>o haz clic para explorar tu equipo</span
-            ><small>WAV, FLAC, MP3, M4A, MP4 y más formatos</small>
+            ><strong>{{ t('Arrastra tus archivos aquí') }}</strong
+            ><span>{{ t('o haz clic para explorar tu equipo') }}</span
+            ><small>{{ t('WAV, FLAC, MP3, M4A, MP4 y más formatos') }}</small>
           </button>
           <div v-else class="source-list">
             <div
@@ -1395,10 +1513,10 @@ onUnmounted(() => {
                     basename(source.path)
                   }}</strong
                   ><small :class="{ 'error-text': source.error }">{{
-                    source.error ||
+                    tMediaMessage(source.error || '') ||
                     (source.probe
                       ? `${source.probe.mediaKind.toUpperCase()} · ${source.probe.durationLabel}`
-                      : "Leyendo archivo…")
+                      : t('Leyendo archivo…'))
                   }}</small></span
                 ><Check
                   v-if="selectedPath === source.path"
@@ -1406,8 +1524,8 @@ onUnmounted(() => {
                 /></button
               ><button
                 class="icon-button"
-                aria-label="Retirar archivo"
-                title="Retirar archivo"
+                :aria-label="t('Retirar archivo')"
+                :title="t('Retirar archivo')"
                 @click="removeSource(source.path)"
               >
                 <X :size="16" />
@@ -1417,8 +1535,8 @@ onUnmounted(() => {
           <p v-if="sources.length > 1" class="panel-footnote">
             {{
               tool === "normalize"
-                ? "Se normalizará cada archivo por separado con el mismo objetivo."
-                : "Editando el archivo seleccionado. Cada exportación usa sus propios cortes."
+                ? t('Se normalizará cada archivo por separado con el mismo objetivo.')
+                : t('Editando el archivo seleccionado. Cada exportación usa sus propios cortes.')
             }}
           </p>
         </div>
@@ -1431,23 +1549,26 @@ onUnmounted(() => {
                 <h2>
                   {{
                     tool === "normalize"
-                      ? "Objetivo de sonoridad"
-                      : "Edición y preescucha"
+                      ? t('Objetivo de sonoridad')
+                      : t('Edición y preescucha')
                   }}
                 </h2>
               </div>
               <span class="tag">{{
-                tool === "normalize" ? "DOS PASADAS" : "PRECISIÓN · 1 ms"
+                  t(tool === "normalize" ? t('DOS PASADAS') : t('PRECISIÓN · 1 ms'))
               }}</span>
+              <button v-if="tool === 'split'" class="secondary-button compact"
+                @click="splitOptions?.scrollIntoView({ block: 'start' })">
+                {{ t("Configurar cortes") }}
+              </button>
             </div>
             <template v-if="tool === 'normalize'">
               <div class="loudness-intro">
                 <span class="loudness-symbol"><Activity :size="30" /></span>
                 <div>
-                  <h3>El mismo objetivo. Cada archivo medido.</h3>
+                  <h3>{{ t('El mismo objetivo. Cada archivo medido.') }}</h3>
                   <p>
-                    Primero analizamos la sonoridad; después aplicamos el
-                    ajuste. El límite de true peak se usa en la normalización.
+                    {{ t('Primero analizamos la sonoridad; después aplicamos el ajuste. El límite de true peak se usa en la normalización.') }}
                   </p>
                 </div>
               </div>
@@ -1458,7 +1579,7 @@ onUnmounted(() => {
                   <button
                     class="play-button"
                     :disabled="!preview || !selectionValid"
-                    :aria-label="playing ? 'Pausar' : 'Reproducir selección'"
+                    :aria-label="t(playing ? 'Pausar' : 'Reproducir selección')"
                     @click="togglePlayback"
                   >
                     <Pause v-if="playing" :size="17" /><Play
@@ -1473,40 +1594,75 @@ onUnmounted(() => {
                     class="icon-button"
                     :class="{ enabled: loop }"
                     :aria-pressed="loop"
-                    title="Repetir selección"
-                    aria-label="Repetir selección"
+                    :title="t('Repetir selección')"
+                    :aria-label="t('Repetir selección')"
                     @click="loop = !loop"
                   >
                     <Repeat2 :size="17" /></button
                   ><span class="toolbar-divider" /><button
                     class="icon-button"
-                    aria-label="Reducir zoom"
-                    :disabled="zoom <= 1"
-                    @click="changeZoom(zoom / 2)"
+                    :aria-label="t('Reducir zoom')"
+                    :title="t('Reducir zoom')"
+                    :disabled="zoomIndex <= 0"
+                    @click="changeZoom(zoomSpans[zoomIndex - 1])"
                   >
                     <Minus :size="16" /></button
-                  ><button
-                    class="zoom-reset"
-                    title="Vista completa"
-                    aria-label="Restablecer zoom"
-                    @click="changeZoom(1)"
+                  ><select
+                    v-model="activeZoom"
+                    class="wave-zoom"
+                    :aria-label="t('Duración visible')"
+                    :title="t('Duración visible')"
+                    :disabled="!levels || zoomSpans.length < 2"
                   >
-                    {{ zoom }}×</button
+                    <option v-for="span in zoomSpans" :key="span" :value="span">
+                      {{ zoomLabel(span) }}
+                    </option>
+                  </select
                   ><button
                     class="icon-button"
-                    aria-label="Aumentar zoom"
-                    :disabled="zoom >= 64 || !levels"
-                    @click="changeZoom(zoom * 2)"
+                    :aria-label="t('Aumentar zoom')"
+                    :title="t('Aumentar zoom')"
+                    :disabled="!levels || zoomIndex >= zoomSpans.length - 1"
+                    @click="changeZoom(zoomSpans[zoomIndex + 1])"
                   >
                     <Plus :size="16" />
                   </button>
                 </div>
               </div>
-              <div ref="waveScroll" class="wave-scroll" @scroll="waveScrolled">
+              <div v-if="duration" class="wave-navigation">
+                <div class="wave-range">
+                  <span>{{ t('Intervalo visible') }}</span>
+                  <span class="timecode">
+                    {{ time(visibleRange.startSeconds) }} – {{ time(visibleRange.endSeconds) }}
+                  </span>
+                </div>
+                <form class="wave-jump" @submit.prevent="jumpToTime">
+                  <label for="wave-jump-time">{{ t('Ir al tiempo') }}</label>
+                  <input
+                    id="wave-jump-time"
+                    v-model="jumpTime"
+                    type="text"
+                    :placeholder="duration >= 3600 ? '00:00:00.000' : '00:00.000'"
+                    autocomplete="off"
+                    :aria-invalid="jumpInvalid"
+                    :aria-describedby="jumpInvalid ? 'wave-jump-error' : undefined"
+                    @input="jumpInvalid = false"
+                  />
+                  <button type="submit" :disabled="!jumpTime.trim()">{{ t('Ir') }}</button>
+                </form>
+                <p v-if="jumpInvalid" id="wave-jump-error" class="wave-jump-error" role="status">
+                  {{ t('Escribe un tiempo dentro del archivo.') }}
+                </p>
+              </div>
+              <div
+                ref="waveScroll"
+                class="wave-scroll"
+                @scroll.passive="waveScrolled"
+              >
                 <div
                   ref="timeline"
                   class="wave-timeline"
-                  :style="{ width: `${zoom * 100}%` }"
+                  :style="{ width: trackWidth ? `${trackWidth}px` : '100%' }"
                   @pointerdown="duration && seek(position($event))"
                   @pointermove="
                     duration &&
@@ -1523,6 +1679,7 @@ onUnmounted(() => {
                     <span
                       v-for="tick in rulerTicks"
                       :key="tick.seconds"
+                      :class="{ 'at-start': tick.seconds === 0, 'at-end': tick.seconds === duration }"
                       :style="{ left: `${percent(tick.seconds)}%` }"
                       >{{ tick.label }}</span
                     >
@@ -1531,7 +1688,7 @@ onUnmounted(() => {
                     v-if="levels"
                     ref="waveCanvas"
                     class="wave-canvas"
-                    aria-label="Forma de onda detallada con niveles medidos en dBFS"
+                    :aria-label="t('Forma de onda detallada con niveles medidos en dBFS')"
                   />
                   <div v-else class="wave-placeholder">
                     <LoaderCircle
@@ -1540,10 +1697,10 @@ onUnmounted(() => {
                       :size="24"
                     /><AudioLines v-else :size="32" /><span>{{
                       levelsBusy
-                        ? "Midiendo la forma de onda…"
+                        ? t('Midiendo la forma de onda…')
                         : sources.length
-                          ? "La forma de onda aparecerá aquí"
-                          : "Importa un archivo para ver su forma de onda"
+                          ? t('La forma de onda aparecerá aquí')
+                          : t('Importa un archivo para ver su forma de onda')
                     }}</span>
                   </div>
                   <div
@@ -1578,16 +1735,16 @@ onUnmounted(() => {
                     <button
                       class="trim-handle start"
                       :style="{ left: `${percent(startSeconds!)}%` }"
-                      aria-label="Inicio de selección"
-                      title="Arrastrar inicio de selección"
+                      :aria-label="t('Inicio de selección')"
+                      :title="t('Arrastrar inicio de selección')"
                       @pointerdown="dragHandle($event, 'start')"
                     >
                       <span /></button
                     ><button
                       class="trim-handle end"
                       :style="{ left: `${percent(endSeconds!)}%` }"
-                      aria-label="Final de selección"
-                      title="Arrastrar final de selección"
+                      :aria-label="t('Final de selección')"
+                      :title="t('Arrastrar final de selección')"
                       @pointerdown="dragHandle($event, 'end')"
                     >
                       <span />
@@ -1603,8 +1760,8 @@ onUnmounted(() => {
                       :key="point"
                       class="cut-marker"
                       :style="{ left: `${percent(point)}%` }"
-                      :title="`Corte ${i + 1}: ${time(point)}`"
-                      :aria-label="`Ir al corte ${i + 1}`"
+                      :title="t('Corte {index}: {time}', { index: i + 1, time: time(point) })"
+                      :aria-label="t('Ir al corte {index}', { index: i + 1 })"
                       @pointerdown.stop="seek(point)"
                     >
                       {{ i + 1 }}
@@ -1618,11 +1775,12 @@ onUnmounted(() => {
                 </div>
               </div>
               <div v-if="levelsError" class="inline-error" role="status">
-                {{ levelsError }}
+                {{ tMediaMessage(levelsError) }}
               </div>
               <div
                 v-if="
-                  tool === 'split' && splitMode === 'silence' && inspectedLevel
+                  tool === 'split' && splitMode === 'silence' && inspectedLevel &&
+                  (!autoSilence || automaticAnalysis)
                 "
                 class="signal-inspector"
               >
@@ -1630,7 +1788,7 @@ onUnmounted(() => {
                   <span class="signal-position"
                     ><Activity :size="14" />{{ time(inspectionTime) }}</span
                   ><span
-                    >Pico
+                    >{{ t('Pico') }}
                     <strong
                       >{{ dbLabel(inspectedLevel.peakDb) }}
                       <small>dBFS</small></strong
@@ -1643,17 +1801,17 @@ onUnmounted(() => {
                     ></span
                   ><span :class="{ 'quiet-reading': inspectedSilence }">{{
                     inspectedSilence
-                      ? `Pausa ≈ ${silenceDuration.toFixed(2)} s`
-                      : "Por encima del umbral"
+                      ? t('Pausa ≈ {duration} s', { duration: silenceDuration.toFixed(2) })
+                      : t(autoSilence ? 'Fuera de una pausa detectada' : 'Por encima del umbral')
                   }}</span>
                 </div>
-                <div class="signal-actions">
+                <div v-if="!autoSilence" class="signal-actions">
                   <button
                     class="text-button"
                     :disabled="suggestedThreshold === null"
                     @click="thresholdDb = suggestedThreshold!"
                   >
-                    Usar {{ suggestedThreshold }} dB de umbral
+                    {{ t('Usar') }} {{ suggestedThreshold }} {{ t('dB de umbral') }}
                     <ArrowRight :size="12" /></button
                   ><button
                     v-if="inspectedSilence"
@@ -1668,7 +1826,7 @@ onUnmounted(() => {
                       )
                     "
                   >
-                    Usar pausa mínima de
+                    {{ t('Usar pausa mínima de') }}
                     {{
                       Math.max(
                         0.05,
@@ -1681,16 +1839,12 @@ onUnmounted(() => {
                     s <ArrowRight :size="12" />
                   </button>
                 </div>
-                <p>
-                  Mide una pausa para orientar el umbral. Mueve el puntero para
-                  medir; haz clic para fijar la posición. Ventanas de 20 ms,
-                  escala en dBFS. El umbral sugerido deja 3 dB sobre el pico
-                  medido; el autosplit confirma las pausas al analizar.
+                <p v-if="!autoSilence">
+                  {{ t('Mide una pausa para orientar el umbral. Mueve el puntero para medir; haz clic para fijar la posición. Ventanas de 20 ms, escala en dBFS. El umbral sugerido deja 3 dB sobre el pico medido; el autosplit confirma las pausas al analizar.') }}
                 </p>
               </div>
               <div v-if="previewError" class="inline-error" role="status">
-                {{ previewError }} La exportación sigue disponible si el archivo
-                es válido.
+                {{ tMediaMessage(previewError) }} {{ t('La exportación sigue disponible si el archivo es válido.') }}
               </div>
               <audio
                 v-if="audioUrl"
@@ -1707,12 +1861,12 @@ onUnmounted(() => {
               />
               <div class="selection-fields">
                 <label
-                  >Inicio
+                  >{{ t('Inicio') }}
                   <input
                     v-model="start"
                     class="time-input"
                     :disabled="!duration"
-                    aria-label="Tiempo de inicio"
+                    :aria-label="t('Tiempo de inicio')"
                     @change="stopPlayback"
                   /><button
                     class="text-button"
@@ -1723,15 +1877,15 @@ onUnmounted(() => {
                       )
                     "
                   >
-                    Usar cursor <kbd>I</kbd>
+                    {{ t('Usar cursor') }} <kbd>I</kbd>
                   </button></label
                 ><ChevronRight :size="18" class="selection-arrow" /><label
-                  >Final
+                  >{{ t('Final') }}
                   <input
                     v-model="end"
                     class="time-input"
                     :disabled="!duration"
-                    aria-label="Tiempo final"
+                    :aria-label="t('Tiempo final')"
                   /><button
                     class="text-button"
                     :disabled="!duration"
@@ -1739,35 +1893,35 @@ onUnmounted(() => {
                       end = time(Math.max(cursor, (startSeconds || 0) + 0.001))
                     "
                   >
-                    Usar cursor <kbd>O</kbd>
+                    {{ t('Usar cursor') }} <kbd>O</kbd>
                   </button></label
                 >
                 <div class="duration-info">
-                  <small>SELECCIÓN</small
+                  <small>{{ t('SELECCIÓN') }}</small
                   ><strong>{{ time(selectionDuration) }}</strong
                   ><button
                     class="text-button"
                     :disabled="!duration"
                     @click="resetSelection"
                   >
-                    <RotateCcw :size="12" />Restablecer
+                    <RotateCcw :size="12" />{{ t('Restablecer') }}
                   </button>
                 </div>
               </div>
               <div class="editor-hint">
-                <span>Segundos o mm:ss.mmm</span
+                <span>{{ t('Segundos o mm:ss.mmm') }}</span
                 ><span
-                  ><kbd>Espacio</kbd> reproducir · <kbd>←</kbd><kbd>→</kbd> 1 s
+                  ><kbd>{{ t('Espacio') }}</kbd> {{ t('reproducir ·') }} <kbd>←</kbd><kbd>→</kbd> 1 s
                   · Shift 0.1 s</span
                 >
               </div>
               <template v-if="tool === 'split'">
-                <div class="split-section">
+                <div ref="splitOptions" class="split-section">
                   <div class="fields-row split-preset-picker">
                     <label>
-                      Preset de Split
-                      <select v-model="presetChoice" aria-label="Preset de Split" @change="applySplitPreset">
-                        <option value="">Elegir preset guardado</option>
+                      {{ t('Preset de Split') }}
+                      <select v-model="presetChoice" :aria-label="t('Preset de Split')" @change="applySplitPreset">
+                        <option value="">{{ t('Elegir preset guardado') }}</option>
                         <option v-for="preset in storedPresets" :key="preset.id" :value="preset.id">
                           {{ preset.name }}
                         </option>
@@ -1779,10 +1933,10 @@ onUnmounted(() => {
                       type="button"
                       @click="deleteSplitPreset"
                     >
-                      Eliminar preset
+                      {{ t('Eliminar preset') }}
                     </button>
                   </div>
-                  <div class="split-mode-tabs" aria-label="Método de división">
+                  <div class="split-mode-tabs" :aria-label="t('Método de división')">
                     <button
                       v-for="(mode, key) in splitModes"
                       :key="key"
@@ -1790,46 +1944,46 @@ onUnmounted(() => {
                       :aria-pressed="splitMode === key"
                       @click="splitMode = key"
                     >
-                      {{ mode.label }}
+                      {{ t(mode.label) }}
                     </button>
                   </div>
                   <p class="split-help">
-                    {{ splitModes[splitMode].help }}
+                    {{ t(splitModes[splitMode].help) }}
                   </p>
                   <div v-if="splitMode === 'duration'" class="fields-row split-parameters">
                     <label>
-                      Duración por segmento
+                      {{ t('Duración por segmento') }}
                       <input
                         v-model="splitDuration"
                         class="time-input"
                         placeholder="03:00.000"
                         @keydown.enter="analyze"
                       />
-                      <small>Segundos o mm:ss.mmm</small>
+                      <small>{{ t('Segundos o mm:ss.mmm') }}</small>
                     </label>
                   </div>
                   <template v-if="splitMode === 'duration'">
                     <label class="split-snap-toggle">
                       <input v-model="snapToPause" type="checkbox" />
-                      Buscar una pausa cerca de cada corte
+                      {{ t('Buscar una pausa cerca de cada corte') }}
                     </label>
                     <div v-if="snapToPause" class="fields-row split-parameters">
                       <label>
-                        Ventana ±
+                        {{ t('Ventana ±') }}
                         <div class="unit-input">
                           <input v-model.number="pauseWindow" type="number" min="0.001" max="60" step="0.1" />
                           <span>s</span>
                         </div>
                       </label>
-                      <label>
-                        Pausa mínima
+                      <label v-if="!autoSilence">
+                        {{ t('Pausa mínima') }}
                         <div class="unit-input">
                           <input v-model.number="snapMinSilence" type="number" min="0.05" max="60" step="0.05" />
                           <span>s</span>
                         </div>
                       </label>
-                      <label>
-                        Umbral
+                      <label v-if="!autoSilence">
+                        {{ t('Umbral') }}
                         <div class="unit-input">
                           <input v-model.number="thresholdDb" type="number" min="-80" max="-5" step="1" />
                           <span>dB</span>
@@ -1837,12 +1991,35 @@ onUnmounted(() => {
                       </label>
                     </div>
                   </template>
+                  <template v-if="usesPauses">
+                    <div class="fields-row split-parameters">
+                      <label>
+                        {{ t("Detección de pausas") }}
+                        <select v-model="autoSilence">
+                          <option :value="true">{{ t("Automática") }}</option>
+                          <option :value="false">{{ t("Manual") }}</option>
+                        </select>
+                      </label>
+                      <label v-if="autoSilence">
+                        {{ t("Sensibilidad") }}
+                        <select v-model="silenceSensitivity">
+                          <option value="conservative">{{ t("Solo pausas claras") }}</option>
+                          <option value="balanced">{{ t("Equilibrada") }}</option>
+                          <option value="sensitive">{{ t("Incluye pausas breves") }}</option>
+                        </select>
+                      </label>
+                    </div>
+                    <label class="split-snap-toggle">
+                      <input v-model="scanAutomatically" type="checkbox" />
+                      {{ t("Analizar al abrir un archivo o cambiar los ajustes") }}
+                    </label>
+                  </template>
                   <div
                     v-if="splitMode === 'silence'"
                     class="fields-row split-parameters"
                   >
-                    <label
-                      >Umbral
+                    <label v-if="!autoSilence"
+                      >{{ t('Umbral') }}
                       <div class="unit-input">
                         <input
                           v-model.number="thresholdDb"
@@ -1852,8 +2029,8 @@ onUnmounted(() => {
                           step="1"
                         /><span>dB</span>
                       </div></label
-                    ><label
-                      >Pausa mínima
+                    ><label v-if="!autoSilence"
+                      >{{ t('Pausa mínima') }}
                       <div class="unit-input">
                         <input
                           v-model.number="minSilence"
@@ -1864,7 +2041,7 @@ onUnmounted(() => {
                         /><span>s</span>
                       </div></label
                     ><label
-                      >Segmento mínimo
+                      >{{ t('Segmento mínimo') }}
                       <div class="unit-input">
                         <input
                           v-model.number="minSegment"
@@ -1881,18 +2058,18 @@ onUnmounted(() => {
                       :disabled="!selectionValid"
                       @click="addMarker()"
                     >
-                      <Plus :size="15" />Corte en cursor <kbd>M</kbd>
+                      <Plus :size="15" />{{ t('Corte en cursor') }} <kbd>M</kbd>
                     </button>
                     <div class="marker-input">
                       <input
                         v-model="markerInput"
                         placeholder="00:30.000"
-                        aria-label="Tiempo de nuevo corte"
+                        :aria-label="t('Tiempo de nuevo corte')"
                         @keydown.enter="addTypedMarker"
                       /><button
                         class="icon-button"
                         :disabled="!selectionValid || !markerInput"
-                        aria-label="Añadir corte con tiempo exacto"
+                        :aria-label="t('Añadir corte con tiempo exacto')"
                         @click="addTypedMarker"
                       >
                         <Plus :size="16" />
@@ -1911,16 +2088,23 @@ onUnmounted(() => {
                       class="spin"
                     /><Activity v-else :size="16" />{{
                       analysisBusy
-                        ? "Analizando archivo…"
-                        : splitModes[splitMode].action
+                        ? t('Analizando archivo…')
+                        : t(splitModes[splitMode].action)
                     }}
                   </button>
+                  <p v-if="automaticAnalysis" class="split-help" role="status">
+                    {{ t("Pausas encontradas: {count} · Umbral: {threshold} dBFS · Pausa mínima: {minimum} s", {
+                      count: automaticAnalysis.pauseCount,
+                      threshold: automaticAnalysis.thresholdDb,
+                      minimum: automaticAnalysis.minSilenceDuration,
+                    }) }}
+                  </p>
                   <button
                     v-if="analysisBusy"
                     class="text-button"
                     @click="invalidateAnalysis"
                   >
-                    Cancelar análisis
+                    {{ t('Cancelar análisis') }}
                   </button>
                   <div
                     v-if="splitMode === 'manual' && markers.length"
@@ -1932,8 +2116,8 @@ onUnmounted(() => {
                       :class="{ muted: !inRangeMarkers.includes(point) }"
                       :title="
                         inRangeMarkers.includes(point)
-                          ? 'Quitar corte'
-                          : 'Fuera de la selección · quitar corte'
+                          ? t('Quitar corte')
+                          : t('Fuera de la selección · quitar corte')
                       "
                       @click="
                         markers = markers.filter((marker) => marker !== point)
@@ -1948,13 +2132,13 @@ onUnmounted(() => {
                   class="segment-review"
                 >
                   <div class="section-top">
-                    <h3>{{ segments.length }} segmento(s)</h3>
+                    <h3>{{ segments.length }} {{ t('segmento(s)') }}</h3>
                     <button
                       v-if="splitMode !== 'manual' && segments.length > 1"
                       class="text-button"
                       @click="editDetectedCuts"
                     >
-                      Ajustar manualmente
+                      {{ t('Ajustar manualmente') }}
                     </button>
                   </div>
                   <div class="segment-list">
@@ -1976,8 +2160,8 @@ onUnmounted(() => {
                       ><button
                         class="icon-button"
                         :disabled="!preview"
-                        :aria-label="`Escuchar segmento ${i + 1}`"
-                        title="Escuchar segmento"
+                        :aria-label="t('Escuchar segmento {index}', { index: i + 1 })"
+                        :title="t('Escuchar segmento')"
                         @click="
                           playRegion(segment.startSeconds, segment.endSeconds)
                         "
@@ -1987,7 +2171,7 @@ onUnmounted(() => {
                       <button
                         class="comparison-button"
                         :disabled="!isTauri()"
-                        :aria-label="`Comparar segmento ${i + 1}`"
+                        :aria-label="t('Comparar segmento {index}', { index: i + 1 })"
                         :aria-pressed="comparisonSegment === segment"
                         @click="compareSegment(segment, i)"
                       >
@@ -1997,15 +2181,15 @@ onUnmounted(() => {
                   </div>
                   <div v-if="comparisonSegment" class="segment-comparison">
                     <div class="comparison-title">
-                      <h3>Preescucha A/B · segmento {{ comparisonIndex }}</h3>
-                      <button class="icon-button" aria-label="Cerrar comparación" @click="invalidateComparison">
+                      <h3>{{ t('Preescucha A/B · segmento') }} {{ comparisonIndex }}</h3>
+                      <button class="icon-button" :aria-label="t('Cerrar comparación')" @click="invalidateComparison">
                         <X :size="14" />
                       </button>
                     </div>
                     <p v-if="comparisonPending" class="comparison-status" role="status">
-                      <LoaderCircle :size="14" class="spin" /> Preparando el audio original y procesado…
+                      <LoaderCircle :size="14" class="spin" /> {{ t('Preparando el audio original y procesado…') }}
                     </p>
-                    <p v-if="comparisonError" class="comparison-status error-text" role="alert">{{ comparisonError }}</p>
+                    <p v-if="comparisonError" class="comparison-status error-text" role="alert">{{ tMediaMessage(comparisonError) }}</p>
                     <SplitComparisonPlayer v-if="comparison" ref="comparisonPlayer"
                       :comparison="comparison"
                       :duration="comparisonSegment.endSeconds - comparisonSegment.startSeconds"
@@ -2017,7 +2201,7 @@ onUnmounted(() => {
             <div v-if="tool !== 'normalize'" class="fade-section">
               <div class="fields-row">
                 <label>
-                  Fade de entrada
+                  {{ t('Fade de entrada') }}
                   <div class="unit-input">
                     <input
                       v-model.number="fades.in"
@@ -2029,7 +2213,7 @@ onUnmounted(() => {
                   </div>
                 </label>
                 <label>
-                  Fade de salida
+                  {{ t('Fade de salida') }}
                   <div class="unit-input">
                     <input
                       v-model.number="fades.out"
@@ -2044,28 +2228,28 @@ onUnmounted(() => {
               <p class="panel-footnote">
                 {{
                   tool === "split"
-                    ? "Los fades se aplican al audio de cada segmento. Cada fade dura como máximo la mitad del segmento. Usa 0 para desactivarlo."
-                    : "Suaviza los bordes del recorte. Usa 0 para conservar el corte directo."
+                    ? t('Los fades se aplican al audio de cada segmento. Cada fade dura como máximo la mitad del segmento. Usa 0 para desactivarlo.')
+                    : t('Suaviza los bordes del recorte. Usa 0 para conservar el corte directo.')
                 }}
               </p>
             </div>
             <div v-if="tool === 'split'" class="split-section">
               <div class="fields-row">
                 <label>
-                  Normalización de sonoridad
+                  {{ t('Normalización de sonoridad') }}
                   <select v-model="splitNormalization">
                     <option
                       v-for="(option, key) in splitNormalizationOptions"
                       :key="key"
                       :value="key"
                     >
-                      {{ option.label }}
+                      {{ t(option.label) }}
                     </option>
                   </select>
                 </label>
               </div>
               <p v-if="splitNormalization !== 'none'" class="split-help normalization-help">
-                {{ splitNormalizationOptions[splitNormalization].help }}
+                {{ t(splitNormalizationOptions[splitNormalization].help) }}
               </p>
             </div>
             <template
@@ -2086,12 +2270,12 @@ onUnmounted(() => {
                       v-if="loudness === preset.value"
                       :size="15" /></span
                   ><strong>{{ preset.value }} <small>LUFS</small></strong>
-                  <p>{{ preset.hint }}</p>
+                  <p>{{ t(preset.hint) }}</p>
                 </button>
               </div>
               <div class="fields-row loudness-fields">
                 <label
-                  >Sonoridad integrada
+                  >{{ t('Sonoridad integrada') }}
                   <div class="unit-input">
                     <input
                       v-model.number="loudness"
@@ -2102,7 +2286,7 @@ onUnmounted(() => {
                     /><span>LUFS</span>
                   </div></label
                 ><label
-                  >Techo de true peak
+                  >{{ t('Techo de true peak') }}
                   <div class="unit-input">
                     <input
                       v-model.number="truePeak"
@@ -2117,9 +2301,7 @@ onUnmounted(() => {
               <div v-if="tool === 'normalize'" class="method-note">
                 <Layers :size="18" />
                 <p>
-                  Medición individual por archivo · rango objetivo de 11 LU ·
-                  salida a 48 kHz. Si el objetivo exige limitar picos o reducir
-                  el rango, el motor aplica normalización dinámica.
+                  {{ t('Cada archivo se mide por separado con un rango objetivo de 11 LU. La salida predeterminada es de 48 kHz.') }}
                 </p>
               </div>
             </template>
@@ -2129,35 +2311,28 @@ onUnmounted(() => {
             <div class="section-top">
               <div>
                 <span class="step-number">03</span>
-                <h2>Exportación</h2>
+                <h2>{{ t('Exportación') }}</h2>
               </div>
             </div>
             <div class="export-body">
               <label
-                >Formato de salida<select v-model="format">
+                >{{ t('Formato de salida') }}<select v-model="format">
                   <option v-for="value in formats" :key="value" :value="value">
                     {{ value.toUpperCase()
-                    }}{{
-                      value === "wav"
-                        ? " · PCM 16 bits"
-                        : value === "mp3"
-                          ? " · 320 kbps"
-                          : value === "flac"
-                            ? " · sin pérdida"
-                            : ""
                     }}
                   </option>
                 </select></label
               >
+              <ExportOptions v-model="currentEncoding" :format="format" />
               <label v-if="tool === 'split'">
-                Patrón de nombres de salida
+                {{ t('Patrón de nombres de salida') }}
                 <input v-model="outputNamePattern" placeholder="{archivo}_part{numero}" maxlength="100" />
-                <small>Usa <code>{numero}</code> para el índice y <code>{archivo}</code> para el nombre original.</small>
+                <small>{{ t('Usa') }} <code>{numero}</code> {{ t('para el índice y') }} <code>{archivo}</code> {{ t('para el nombre original.') }}</small>
               </label>
               <label
-                >Destino<select v-model="destination">
-                  <option value="source">Junto al archivo original</option>
-                  <option value="custom">Carpeta personalizada</option>
+                >{{ t('Destino') }}<select v-model="destination">
+                  <option value="source">{{ t('Junto al archivo original') }}</option>
+                  <option value="custom">{{ t('Carpeta personalizada') }}</option>
                 </select></label
               ><button
                 v-if="destination === 'custom'"
@@ -2165,13 +2340,13 @@ onUnmounted(() => {
                 @click="chooseDestination"
               >
                 <FolderOpen :size="17" /><span :title="outputDir">{{
-                  outputDir || "Seleccionar carpeta"
+                  outputDir || t('Seleccionar carpeta')
                 }}</span>
               </button>
               <div class="export-summary">
                 <div>
                   <span>{{
-                    tool === "normalize" ? "Archivos" : "Archivo seleccionado"
+                    tool === "normalize" ? t('Archivos') : t('Archivo seleccionado')
                   }}</span
                   ><strong>{{
                     tool === "normalize"
@@ -2183,7 +2358,7 @@ onUnmounted(() => {
                 </div>
                 <div>
                   <span>{{
-                    tool === "normalize" ? "Objetivo" : "Duración"
+                    tool === "normalize" ? t('Objetivo') : t('Duración')
                   }}</span
                   ><strong>{{
                     tool === "normalize"
@@ -2192,11 +2367,11 @@ onUnmounted(() => {
                   }}</strong>
                 </div>
                 <div v-if="tool === 'split'">
-                  <span>Archivos de salida</span
+                  <span>{{ t('Archivos de salida') }}</span
                   ><strong>{{
                     autoReviewed && segments.length > 1
                       ? segments.length
-                      : "Por revisar"
+                      : t('Por revisar')
                   }}</strong>
                 </div>
                 <div v-if="tool === 'normalize'">
@@ -2206,8 +2381,7 @@ onUnmounted(() => {
               <div class="original-note">
                 <Check :size="16" />
                 <p>
-                  Los originales se conservan. Cada exportación recibe un nombre
-                  disponible.
+                  {{ t('Los originales se conservan. Cada exportación recibe un nombre disponible.') }}
                 </p>
               </div>
               <button
@@ -2217,36 +2391,36 @@ onUnmounted(() => {
               >
                 {{
                   tool === "split"
-                    ? "Exportar segmentos"
+                    ? t('Exportar segmentos')
                     : tool === "normalize"
-                      ? "Normalizar archivos"
-                      : "Exportar recorte"
+                      ? t('Normalizar archivos')
+                      : t('Exportar recorte')
                 }}<ArrowRight :size="17" />
               </button>
               <div v-if="tool === 'split'" class="split-preset-save">
                 <div class="fields-row">
                   <label>
-                    Nombre del preset
+                    {{ t('Nombre del preset') }}
                     <input v-model="presetName" maxlength="80" @keydown.enter="saveSplitPreset" />
                   </label>
                 </div>
                 <button class="secondary-button compact" :disabled="!presetName.trim()" @click="saveSplitPreset">
-                  {{ matchingPreset ? "Actualizar preset" : "Guardar preset" }}
+                  {{ matchingPreset ? t('Actualizar preset') : t('Guardar preset') }}
                 </button>
-                <p v-if="presetStatus" class="comparison-status" role="status">{{ presetStatus }}</p>
+                <p v-if="presetStatus" class="comparison-status" role="status">{{ tMediaMessage(presetStatus) }}</p>
               </div>
               <p class="export-validation" role="status">
-                {{ exportProblem || "Todo listo para exportar." }}
+                {{ t(exportProblem) || t('Todo listo para exportar.') }}
               </p>
             </div>
           </aside>
         </div>
       </template>
       <div v-if="error" class="error-banner" role="alert">
-        <span>{{ error }}</span
+        <span>{{ tMediaMessage(error) }}</span
         ><button
           class="icon-button"
-          aria-label="Cerrar error"
+          :aria-label="t('Cerrar error')"
           @click="error = ''"
         >
           <X :size="16" />
@@ -2255,7 +2429,7 @@ onUnmounted(() => {
     </div>
     <div v-if="dragging" class="drop-overlay">
       <Upload :size="38" />
-      <h2>Suelta tus archivos para importarlos</h2>
+      <h2>{{ t('Suelta tus archivos para importarlos') }}</h2>
     </div>
   </div>
 </template>

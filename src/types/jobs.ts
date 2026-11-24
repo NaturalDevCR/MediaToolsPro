@@ -8,6 +8,16 @@ export type MediaKind = "audio" | "video";
 export type Tool = "trim" | "split" | "normalize";
 export type SplitMode = "none" | "silence" | "chapters" | "duration" | "manual";
 export type SplitNormalization = "none" | "before" | "after";
+export type SilenceSensitivity = "conservative" | "balanced" | "sensitive";
+export interface ExportEncoding {
+  sampleRate?: number;
+  channels?: number;
+  audioBitrateKbps?: number;
+  pcmBitDepth?: number;
+  vorbisQuality?: number;
+  flacCompression?: number;
+  videoQuality?: "high" | "balanced" | "compact";
+}
 export interface Segment {
   startSeconds: number;
   endSeconds: number;
@@ -16,6 +26,7 @@ export interface ProcessJobRequest {
   inputPath: string;
   outputDir?: string;
   format: string;
+  encoding?: ExportEncoding;
   trimStart?: string;
   trimEnd?: string;
   normalize: boolean;
@@ -32,9 +43,21 @@ export interface ProcessJobRequest {
     thresholdDb: number;
     minSilenceDuration: number;
     minSegmentDuration: number;
+    automatic?: boolean;
+    sensitivity?: SilenceSensitivity;
   };
   fadeInDuration: number;
   fadeOutDuration: number;
+}
+export interface AutomaticSilence {
+  thresholdDb: number;
+  minSilenceDuration: number;
+  pauseCount: number;
+  pauses: Segment[];
+}
+export interface SplitPlan {
+  segments: Segment[];
+  automatic: AutomaticSilence | null;
 }
 export interface QueueItemData {
   id: string;

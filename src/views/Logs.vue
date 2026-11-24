@@ -1,10 +1,25 @@
 <script setup lang="ts">
 import { computed, ref, watch, nextTick, onMounted } from "vue";
-import { logs, clearLogs } from "../stores/logs";
+import { logs, clearLogs, type LogEntry } from "../stores/logs";
 import { Trash2, Terminal } from "lucide-vue-next";
+import { locale, t, tMediaMessage } from "../lib/i18n";
+
+const scopeLabels: Record<LogEntry["scope"] | "all", string> = {
+  all: "Todo",
+  audio: "Audio",
+  video: "Vídeo",
+  system: "Sistema",
+};
+const levelLabels: Record<LogEntry["level"], string> = {
+  info: "Info",
+  warn: "Aviso",
+  error: "Error",
+  success: "Éxito",
+};
+const scopes = ["all", "audio", "video", "system"] as const;
 
 const logContainer = ref<HTMLElement | null>(null);
-const scopeFilter = ref<"all" | "audio" | "video" | "system">("all");
+const scopeFilter = ref<(typeof scopes)[number]>("all");
 const filteredLogs = computed(() =>
   scopeFilter.value === "all"
     ? logs.value
@@ -23,7 +38,7 @@ watch(() => filteredLogs.value.length, scrollToBottom);
 onMounted(scrollToBottom);
 
 function formatTime(date: Date) {
-  return date.toLocaleTimeString();
+  return date.toLocaleTimeString(locale.value);
 }
 
 function getLevelClass(level: string) {
@@ -61,16 +76,17 @@ function getScopeClass(scope: string) {
     >
       <div class="flex items-center gap-2 text-gray-700 dark:text-gray-200">
         <Terminal class="w-5 h-5" />
-        <h2 class="font-medium">Actividad del estudio</h2>
+        <h2 class="font-medium">{{ t("Actividad del estudio") }}</h2>
       </div>
       <div class="flex items-center gap-3">
         <div
           class="flex rounded-xl border border-black/5 dark:border-white/10 bg-black/5 dark:bg-white/[0.04] p-1"
         >
           <button
-            v-for="scope in ['all', 'audio', 'video', 'system']"
+            v-for="scope in scopes"
             :key="scope"
-            @click="scopeFilter = scope as typeof scopeFilter.value"
+            :aria-pressed="scopeFilter === scope"
+            @click="scopeFilter = scope"
             class="px-3 py-1.5 rounded-lg text-xs font-semibold capitalize transition-colors"
             :class="
               scopeFilter === scope
@@ -78,7 +94,7 @@ function getScopeClass(scope: string) {
                 : 'text-gray-600 dark:text-gray-300 hover:bg-black/5 dark:hover:bg-white/5'
             "
           >
-            {{ scope }}
+            {{ t(scopeLabels[scope]) }}
           </button>
         </div>
         <button
@@ -86,7 +102,7 @@ function getScopeClass(scope: string) {
           class="flex items-center gap-2 px-3 py-1.5 rounded-lg text-sm text-red-500 hover:bg-red-500/10 transition-colors"
         >
           <Trash2 class="w-4 h-4" />
-          Limpiar
+          {{ t("Limpiar") }}
         </button>
       </div>
     </div>
@@ -100,7 +116,7 @@ function getScopeClass(scope: string) {
         v-if="filteredLogs.length === 0"
         class="text-center text-gray-400 py-10 italic"
       >
-        No hay actividad para mostrar
+        {{ t("No hay actividad para mostrar") }}
       </div>
 
       <div
@@ -108,23 +124,25 @@ function getScopeClass(scope: string) {
         :key="log.id"
         class="flex gap-3 p-2 rounded border border-transparent hover:bg-black/5 dark:hover:bg-white/5 transition-colors"
       >
-        <span class="text-gray-400 select-none text-xs mt-0.5 w-[70px]">{{
+        <span class="text-gray-400 select-none text-xs mt-0.5 w-[86px] shrink-0">{{
           formatTime(log.timestamp)
         }}</span>
         <span
           class="uppercase text-[10px] font-bold px-1.5 py-0.5 rounded border h-fit select-none"
           :class="getScopeClass(log.scope)"
         >
-          {{ log.scope }}
+          {{ t(scopeLabels[log.scope]) }}
         </span>
         <span
           class="uppercase text-[10px] font-bold px-1.5 py-0.5 rounded border h-fit select-none"
           :class="getLevelClass(log.level)"
         >
-          {{ log.level }}
+          {{ t(levelLabels[log.level]) }}
         </span>
         <span class="flex-1 break-all text-gray-700 dark:text-gray-300">{{
-          log.message
+          log.source
+            ? `${log.source}: ${tMediaMessage(log.message)}`
+            : tMediaMessage(log.message)
         }}</span>
       </div>
     </div>

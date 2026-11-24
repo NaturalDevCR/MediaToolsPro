@@ -10,6 +10,11 @@ import type {
 import { addLog } from "./logs";
 
 const KEY = "mediatoolspro.studio.queue.v2";
+const finishedStatusLabels = {
+  done: "Completado",
+  error: "Error",
+  cancelled: "Cancelado",
+} as const;
 export const queue = ref<QueueItemData[]>([]);
 export const queueReady = ref(false);
 export const runningCount = computed(
@@ -65,14 +70,17 @@ export async function initStudio() {
       // A partially rendered file must never be exposed as a completed output.
       if (payload.status === "done") item.outputPath = payload.outputPath;
       item.error = payload.error;
-      if (["done", "error", "cancelled"].includes(payload.status)) {
+      const status = payload.status;
+      if (status === "done" || status === "error" || status === "cancelled") {
         addLog(
-          `${item.title}: ${payload.detail || payload.status}`,
-          payload.status === "done"
+          payload.detail || finishedStatusLabels[status],
+          status === "done"
             ? "success"
-            : payload.status === "error"
+            : status === "error"
               ? "error"
               : "warn",
+          "system",
+          item.title,
         );
         void pump();
       }

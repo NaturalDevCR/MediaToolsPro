@@ -8,6 +8,8 @@ import {
   RotateCcw,
   LoaderCircle,
 } from "lucide-vue-next";
+import { t } from "../lib/i18n";
+
 const status = ref<{ ffmpeg: boolean; ffmpeg_version?: string }>({
   ffmpeg: false,
 });
@@ -42,13 +44,13 @@ onMounted(check);
 </script>
 <template>
   <div class="settings-page">
-    <div class="eyebrow">CONFIGURACIÓN DEL ESTUDIO</div>
-    <h1>Ajustes<span>.</span></h1>
+    <div class="eyebrow">{{ t("CONFIGURACIÓN DEL ESTUDIO") }}</div>
+    <h1>{{ t("Ajustes") }}<span>.</span></h1>
     <div class="panel">
       <div class="section-top">
         <div>
           <Activity :size="17" />
-          <h2>Motor de procesamiento</h2>
+          <h2>{{ t("Motor de procesamiento") }}</h2>
         </div>
         <span class="tag">FFMPEG</span>
       </div>
@@ -61,17 +63,15 @@ onMounted(check);
             v-else-if="status.ffmpeg"
             :size="18"
           /><CircleAlert v-else :size="18" />{{
-            checking
+            t(checking
               ? "Comprobando motor…"
               : status.ffmpeg
                 ? "Motor disponible"
-                : "Motor no disponible"
+                : "Motor no disponible")
           }}
         </div>
         <p>
-          Trim, Split y Normalize utilizan FFmpeg en tu equipo. El estudio
-          reconoce tanto la instalación de MediaToolsPro como una instalación
-          del sistema. El procesamiento de tus archivos se realiza localmente.
+          {{ t("Trim, Split y Normalize utilizan FFmpeg en tu equipo. El estudio reconoce tanto la instalación de MediaToolsPro como una instalación del sistema. El procesamiento de tus archivos se realiza localmente.") }}
         </p>
         <div v-if="status.ffmpeg_version" class="engine-version">
           {{ status.ffmpeg_version }}
@@ -82,7 +82,7 @@ onMounted(check);
             :disabled="checking || installing || !isTauri()"
             @click="check"
           >
-            <RotateCcw :size="15" />Volver a comprobar</button
+            <RotateCcw :size="15" />{{ t("Volver a comprobar") }}</button
           ><button
             v-if="!status.ffmpeg"
             class="primary-button"
@@ -90,15 +90,14 @@ onMounted(check);
             @click="install"
           >
             <LoaderCircle v-if="installing" :size="15" class="spin" />{{
-              installing ? "Instalando motor…" : "Instalar FFmpeg"
+              t(installing ? "Instalando motor…" : "Instalar FFmpeg")
             }}
           </button>
         </div>
         <p v-if="installing">
-          La instalación necesita conexión a internet y puede tardar unos
-          minutos.
+          {{ t("La instalación necesita conexión a internet y puede tardar unos minutos.") }}
         </p>
-        <p v-if="error" class="error-text" role="alert">{{ error }}</p>
+        <p v-if="error" class="error-text" role="alert">{{ t(error) }}</p>
       </div>
     </div>
   </div>

@@ -1,6 +1,7 @@
+use crate::encoding::EncodingSettings;
 use crate::jobs::{
-    emit_job_progress, emit_log, is_audio_format, media_kind_for_format, JobProgressPayload,
-    JobState,
+    emit_job_progress, emit_log, is_audio_format, is_video_format, media_kind_for_format,
+    JobProgressPayload, JobState,
 };
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -55,6 +56,19 @@ pub struct SilenceSplitSettings {
     pub min_silence_duration: f64,
     #[serde(default = "default_min_segment_duration")]
     pub min_segment_duration: f64,
+    #[serde(default)]
+    pub automatic: bool,
+    #[serde(default)]
+    pub sensitivity: SilenceSensitivity,
+}
+
+#[derive(Deserialize, Clone, Copy, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum SilenceSensitivity {
+    Conservative,
+    #[default]
+    Balanced,
+    Sensitive,
 }
 
 impl Default for SilenceSplitSettings {
@@ -63,6 +77,8 @@ impl Default for SilenceSplitSettings {
             threshold_db: default_silence_threshold_db(),
             min_silence_duration: default_silence_min_duration(),
             min_segment_duration: default_min_segment_duration(),
+            automatic: false,
+            sensitivity: SilenceSensitivity::Balanced,
         }
     }
 }
@@ -83,6 +99,7 @@ pub struct ProcessMediaRequest {
     pub true_peak_dbtp: f32,
     pub eq: EqualizerSettings,
     pub audio_target: Option<String>,
+    pub(crate) encoding: Option<EncodingSettings>,
     #[serde(default)]
     pub split_mode: SplitMode,
     pub split_duration_seconds: Option<f64>,
@@ -137,6 +154,22 @@ struct InputMediaInfo {
 pub struct Segment {
     start_seconds: f64,
     end_seconds: f64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SplitPlan {
+    segments: Vec<Segment>,
+    automatic: Option<AutomaticSilence>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AutomaticSilence {
+    threshold_db: f32,
+    min_silence_duration: f64,
+    pause_count: usize,
+    pauses: Vec<Segment>,
 }
 
 #[derive(Serialize)]
@@ -309,15 +342,17 @@ async fn run_media_process<R: Runtime>(
     let resolved_output_dir = resolve_output_dir(&request, &request.input_path)?;
 
     fs::create_dir_all(&resolved_output_dir).map_err(|e| e.to_string())?;
-    let segments = build_segments(
+    let segments = plan_segments(
         &ffmpeg_path,
         &request,
         region_start,
         region_end,
+        waveform_cache_dir(&app).as_deref(),
         &pid,
         &cancelled,
     )
-    .await?;
+    .await?
+    .segments;
     let segment_count = segments.len();
     let mut final_output_path = resolved_output_dir.to_string_lossy().to_string();
 
@@ -760,6 +795,121 @@ async fn build_segments(
     }
 }
 
+async fn plan_segments(
+    ffmpeg: &Path,
+    request: &ProcessMediaRequest,
+    start: f64,
+    end: f64,
+    cache: Option<&Path>,
+    pid: &Arc<Mutex<Option<u32>>>,
+    cancelled: &Arc<AtomicBool>,
+) -> Result<SplitPlan, String> {
+    let snap_window = request.split_pause_window_seconds.unwrap_or(0.0);
+    let snap = request.split_mode == SplitMode::Duration && snap_window > 0.0;
+    if !request.silence.automatic || (!snap && request.split_mode != SplitMode::Silence) {
+        let segments = build_segments(ffmpeg, request, start, end, pid, cancelled).await?;
+        return Ok(SplitPlan {
+            segments,
+            automatic: None,
+        });
+    }
+
+    let levels = cached_waveform_levels(ffmpeg, &request.input_path, cache, pid, cancelled).await?;
+    let automatic = automatic_pauses(&levels, start, end, request.silence.sensitivity);
+    let segments = if snap {
+        let nominal = build_duration_segments(start, end, request.split_duration_seconds)?;
+        snap_duration_cuts(&nominal, &automatic.pauses, snap_window)?
+    } else {
+        silence_segments_from_pauses(
+            start,
+            end,
+            request.silence.min_segment_duration,
+            &automatic.pauses,
+        )?
+    };
+    Ok(SplitPlan {
+        segments,
+        automatic: Some(automatic),
+    })
+}
+
+fn level_percentile(histogram: &[usize; 133], frames: usize, fraction: f64) -> f32 {
+    let rank = ((frames.saturating_sub(1)) as f64 * fraction).floor() as usize;
+    let mut cumulative = 0;
+    for (index, count) in histogram.iter().enumerate() {
+        cumulative += count;
+        if cumulative > rank {
+            return index as f32 - 120.0;
+        }
+    }
+    -120.0
+}
+
+fn automatic_pauses(
+    levels: &WaveformLevelsResponse,
+    start: f64,
+    end: f64,
+    sensitivity: SilenceSensitivity,
+) -> AutomaticSilence {
+    let interval = levels.interval_seconds;
+    let len = levels.peaks_db.len();
+    let first = ((start / interval).floor() as usize).min(len);
+    let last = ((end / interval).ceil() as usize).min(len);
+    let mut histogram = [0; 133];
+    for peak in &levels.peaks_db[first..last] {
+        histogram[(peak.round().clamp(-120.0, 12.0) + 120.0) as usize] += 1;
+    }
+    // Use a quiet tail and the typical active signal. Even on material with a few
+    // quiet windows this leaves room between room tone and low-level wanted audio.
+    let frames = last - first;
+    let active = level_percentile(&histogram, frames, 0.85);
+    let quiet = level_percentile(&histogram, frames, 0.02);
+    let (adjustment, min_silence_duration) = match sensitivity {
+        SilenceSensitivity::Conservative => (-4.0, 0.8),
+        SilenceSensitivity::Balanced => (0.0, 0.45),
+        SilenceSensitivity::Sensitive => (4.0, 0.25),
+    };
+    let baseline = if active - quiet >= 10.0 {
+        (quiet + 6.0).clamp(active - 32.0, active - 8.0)
+    } else {
+        active - 17.0
+    };
+    let threshold_db = (baseline + adjustment).min(active - 6.0).clamp(-80.0, -5.0);
+
+    let mut pauses = Vec::new();
+    if active > -75.0 {
+        let mut opening = None;
+        let mut quiet_end = 0;
+        for frame in first..=last {
+            let hysteresis = if opening.is_some() { 2.0 } else { 0.0 };
+            let is_quiet = frame < last
+                && levels.peaks_db[frame] <= threshold_db + hysteresis
+                && levels.rms_db[frame] <= threshold_db - 3.0 + hysteresis;
+            if is_quiet {
+                opening.get_or_insert(frame);
+                quiet_end = frame + 1;
+            } else if frame == last || frame >= quiet_end + 2 {
+                if let Some(open) = opening.take() {
+                    let pause_start = (open as f64 * interval).max(start);
+                    let pause_end = (quiet_end as f64 * interval).min(end);
+                    if pause_end - pause_start >= min_silence_duration {
+                        pauses.push(Segment {
+                            start_seconds: pause_start,
+                            end_seconds: pause_end,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    AutomaticSilence {
+        threshold_db,
+        min_silence_duration,
+        pause_count: pauses.len(),
+        pauses,
+    }
+}
+
 fn snap_duration_cuts(
     segments: &[Segment],
     pauses: &[Segment],
@@ -903,14 +1053,28 @@ async fn build_silence_segments(
     cancelled: &Arc<AtomicBool>,
 ) -> Result<Vec<Segment>, String> {
     let pauses = detect_silences(ffmpeg_path, request, pid, cancelled).await?;
+    silence_segments_from_pauses(
+        region_start,
+        region_end,
+        request.silence.min_segment_duration,
+        &pauses,
+    )
+}
+
+fn silence_segments_from_pauses(
+    region_start: f64,
+    region_end: f64,
+    min_segment_duration: f64,
+    pauses: &[Segment],
+) -> Result<Vec<Segment>, String> {
     let mut boundaries = vec![region_start];
     for pause in pauses {
         let midpoint = (pause.start_seconds + pause.end_seconds) / 2.0;
         let last_boundary = *boundaries.last().unwrap_or(&region_start);
         if midpoint > region_start
             && midpoint < region_end
-            && midpoint - last_boundary >= request.silence.min_segment_duration
-            && region_end - midpoint >= request.silence.min_segment_duration
+            && midpoint - last_boundary >= min_segment_duration
+            && region_end - midpoint >= min_segment_duration
         {
             boundaries.push(midpoint);
         }
@@ -1228,10 +1392,16 @@ fn fade_filters(request: &ProcessMediaRequest, segment_duration: f64) -> Vec<Str
 
 fn apply_output_format_args(
     args: &mut Vec<String>,
-    format: &str,
-    audio_target: Option<&str>,
+    request: &ProcessMediaRequest,
     audio_map: &str,
 ) {
+    let format = request.format.as_str();
+    let azuracast_target = is_azuracast_target(request.audio_target.as_deref());
+    let normalize = !azuracast_target
+        && (request.normalize || request.split_normalization != SplitNormalization::None);
+    let default_encoding = EncodingSettings::default();
+    let encoding = request.encoding.as_ref().unwrap_or(&default_encoding);
+
     if is_audio_format(format) {
         args.extend(
             [
@@ -1246,49 +1416,8 @@ fn apply_output_format_args(
             .iter()
             .map(ToString::to_string),
         );
-        let azuracast_target = is_azuracast_target(audio_target);
-
-        match if azuracast_target { "mp3" } else { format } {
-            "mp3" => {
-                args.extend(
-                    ["-c:a", "libmp3lame", "-b:a", "320k"]
-                        .iter()
-                        .map(ToString::to_string),
-                );
-            }
-            "opus" => {
-                args.extend(
-                    ["-c:a", "libopus", "-b:a", "192k"]
-                        .iter()
-                        .map(ToString::to_string),
-                );
-            }
-            "flac" => {
-                args.extend(["-c:a", "flac"].iter().map(ToString::to_string));
-            }
-            "ogg" => {
-                args.extend(
-                    ["-c:a", "libvorbis", "-q:a", "6"]
-                        .iter()
-                        .map(ToString::to_string),
-                );
-            }
-            "wav" => {
-                args.extend(["-c:a", "pcm_s16le"].iter().map(ToString::to_string));
-            }
-            "m4a" | "aac" => {
-                args.extend(
-                    ["-c:a", "aac", "-b:a", "256k"]
-                        .iter()
-                        .map(ToString::to_string),
-                );
-            }
-            _ => {
-                args.extend(["-c:a", "copy"].iter().map(ToString::to_string));
-            }
-        }
-
         if azuracast_target {
+            default_encoding.apply_audio_args(args, "mp3", false);
             args.extend(
                 [
                     "-ar",
@@ -1303,6 +1432,8 @@ fn apply_output_format_args(
                 .iter()
                 .map(ToString::to_string),
             );
+        } else {
+            encoding.apply_audio_args(args, format, normalize);
         }
 
         return;
@@ -1329,55 +1460,10 @@ fn apply_output_format_args(
         args.extend(["-map_metadata".into(), "0".into()]);
     }
 
-    match format {
-        "webm" => {
-            args.extend(
-                [
-                    "-c:v",
-                    "libvpx-vp9",
-                    "-crf",
-                    "32",
-                    "-b:v",
-                    "0",
-                    "-c:a",
-                    "libopus",
-                    "-b:a",
-                    "160k",
-                ]
-                .iter()
-                .map(ToString::to_string),
-            );
-        }
-        "mkv" => {
-            args.extend(
-                [
-                    "-c:v", "libx264", "-preset", "medium", "-crf", "20", "-c:a", "aac", "-b:a",
-                    "192k",
-                ]
-                .iter()
-                .map(ToString::to_string),
-            );
-        }
-        _ => {
-            args.extend(
-                [
-                    "-c:v",
-                    "libx264",
-                    "-preset",
-                    "medium",
-                    "-crf",
-                    "20",
-                    "-c:a",
-                    "aac",
-                    "-b:a",
-                    "192k",
-                    "-movflags",
-                    "+faststart",
-                ]
-                .iter()
-                .map(ToString::to_string),
-            );
-        }
+    encoding.apply_video_args(args, format);
+    encoding.apply_audio_args(args, format, normalize);
+    if matches!(format, "mp4" | "mov") {
+        args.extend(["-movflags".into(), "+faststart".into()]);
     }
 }
 
@@ -1480,11 +1566,18 @@ fn validate_request(request: &ProcessMediaRequest) -> Result<(), String> {
     if !Path::new(&request.input_path).is_file() {
         return Err("El archivo de origen no existe.".into());
     }
-    if !matches!(
-        request.format.as_str(),
-        "wav" | "flac" | "mp3" | "m4a" | "aac" | "ogg" | "opus" | "mp4" | "mkv" | "webm"
-    ) {
-        return Err("Formato de salida no compatible.".into());
+    let format = request.format.as_str();
+    if !is_audio_format(format) && !is_video_format(format) {
+        return Err("Unsupported output format.".into());
+    }
+    if let Some(encoding) = &request.encoding {
+        if is_audio_format(format)
+            && is_azuracast_target(request.audio_target.as_deref())
+            && encoding != &EncodingSettings::default()
+        {
+            return Err("AzuraCast uses fixed MP3 encoding settings.".into());
+        }
+        encoding.validate(format)?;
     }
     if request.split_normalization != SplitNormalization::None
         && (request.normalize || request.split_mode == SplitMode::None)
@@ -1533,6 +1626,15 @@ pub async fn preview_segments<R: Runtime>(
     state: State<'_, JobState>,
     request: ProcessMediaRequest,
 ) -> Result<Vec<Segment>, String> {
+    Ok(analyze_split(app, state, request).await?.segments)
+}
+
+#[tauri::command]
+pub async fn analyze_split<R: Runtime>(
+    app: AppHandle<R>,
+    state: State<'_, JobState>,
+    request: ProcessMediaRequest,
+) -> Result<SplitPlan, String> {
     validate_request(&request)?;
     let (pid, cancelled) = state.register(&request.id)?;
     let result = async {
@@ -1543,7 +1645,16 @@ pub async fn preview_segments<R: Runtime>(
             &request.trim_start,
             &request.trim_end,
         )?;
-        build_segments(&ffmpeg, &request, start, end, &pid, &cancelled).await
+        plan_segments(
+            &ffmpeg,
+            &request,
+            start,
+            end,
+            waveform_cache_dir(&app).as_deref(),
+            &pid,
+            &cancelled,
+        )
+        .await
     }
     .await;
     state.remove(&request.id);
@@ -1640,6 +1751,7 @@ async fn render_comparison_files(
 ) -> Result<SplitComparison, String> {
     request.format = "wav".into();
     request.audio_target = None;
+    request.encoding = None;
     let original_path = directory.join("A.wav");
     let processed_path = directory.join("B.wav");
     let normalized_audio = if request.split_normalization == SplitNormalization::Before {
@@ -1949,17 +2061,7 @@ fn segment_render_args(
         args.push(filter_chain.to_string());
     }
 
-    apply_output_format_args(
-        &mut args,
-        &request.format,
-        request.audio_target.as_deref(),
-        audio_map,
-    );
-    if (request.normalize || request.split_normalization != SplitNormalization::None)
-        && !is_azuracast_target(request.audio_target.as_deref())
-    {
-        args.extend(["-ar".into(), "48000".into()]);
-    }
+    apply_output_format_args(&mut args, request, audio_map);
 
     args.push("-progress".to_string());
     args.push("pipe:1".to_string());
@@ -2132,6 +2234,50 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn normalized_video_export_uses_the_selected_sample_rate_and_bitrate_once() {
+        let fixture = Fixture::new();
+        let input = fixture.0.join("input.mp4");
+        fs::write(&input, "source").unwrap();
+        let request = serde_json::from_value(serde_json::json!({
+            "id": "test", "inputPath": input, "format": "mov", "normalize": true,
+            "eq": { "bass": 0, "mid": 0, "treble": 0 },
+            "encoding": { "sampleRate": 44100, "audioBitrateKbps": 128, "videoQuality": "high" }
+        }))
+        .unwrap();
+        validate_request(&request).unwrap();
+        let segment = Segment {
+            start_seconds: 0.0,
+            end_seconds: 4.0,
+        };
+        let args = segment_render_args(&request, &segment, "", &fixture.0.join("out.mov"), None);
+        let values_for = |option| {
+            args.windows(2)
+                .filter(|pair| pair[0] == option)
+                .map(|pair| pair[1].as_str())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(values_for("-ar"), ["44100"]);
+        assert_eq!(values_for("-b:a"), ["128k"]);
+        assert_eq!(values_for("-c:v"), ["libx264"]);
+        assert_eq!(values_for("-crf"), ["16"]);
+    }
+
+    #[test]
+    fn rejects_encoding_settings_for_the_wrong_output_format() {
+        let fixture = Fixture::new();
+        let input = fixture.0.join("input.wav");
+        fs::write(&input, "source").unwrap();
+        let request = serde_json::from_value(serde_json::json!({
+            "id": "test", "inputPath": input, "format": "flac", "normalize": false,
+            "eq": { "bass": 0, "mid": 0, "treble": 0 },
+            "encoding": { "audioBitrateKbps": 128 }
+        }))
+        .unwrap();
+        assert!(validate_request(&request).is_err());
+    }
+
     #[test]
     fn split_exports_expand_the_source_name_and_index_without_overwriting() {
         let fixture = Fixture::new();
@@ -2239,6 +2385,86 @@ mod tests {
             None
         );
     }
+    #[tokio::test]
+    #[ignore = "Requires FFmpeg on PATH"]
+    async fn automatic_silence_finds_a_pause_above_the_manual_noise_floor() {
+        let fixture = Fixture::new();
+        let input = fixture.0.join("room-tone.wav");
+        ffmpeg(&[
+            "-f",
+            "lavfi",
+            "-i",
+            r"aevalsrc=sin(2*PI*997*t)*if(between(t\,2.2\,2.9)\,0.045\,0.27):s=48000:d=6",
+            input.to_str().unwrap(),
+        ])
+        .await;
+        let mut request = request(&input);
+        request.split_mode = SplitMode::Silence;
+        request.silence.min_segment_duration = 0.8;
+        let (pid, cancelled) = control();
+        let engine = Path::new("ffmpeg");
+        let manual = build_segments(engine, &request, 0.0, 6.0, &pid, &cancelled)
+            .await
+            .unwrap();
+        assert_eq!(manual.len(), 1);
+
+        request.silence.automatic = true;
+        let plan = plan_segments(engine, &request, 0.0, 6.0, None, &pid, &cancelled)
+            .await
+            .unwrap();
+        assert_eq!(plan.segments.len(), 2);
+        assert!(
+            (plan.segments[0].end_seconds - 2.55).abs() < 0.01,
+            "{:?}",
+            plan.segments
+        );
+        assert!(plan.automatic.unwrap().threshold_db > -27.0);
+        let steady = plan_segments(engine, &request, 3.0, 6.0, None, &pid, &cancelled)
+            .await
+            .unwrap();
+        assert_eq!(steady.segments.len(), 1);
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires FFmpeg on PATH"]
+    async fn aiff_export_respects_the_requested_sample_rate_channels_and_bit_depth() {
+        let fixture = Fixture::new();
+        let source = fixture.0.join("source.wav");
+        let output = fixture.0.join("audio.aiff");
+        ffmpeg(&[
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:sample_rate=44100:duration=1",
+            source.to_str().unwrap(),
+        ])
+        .await;
+        let request: ProcessMediaRequest = serde_json::from_value(serde_json::json!({
+            "id": "test", "inputPath": source, "format": "aiff", "normalize": false,
+            "eq": { "bass": 0, "mid": 0, "treble": 0 },
+            "encoding": { "sampleRate": 96000, "channels": 2, "pcmBitDepth": 24 }
+        }))
+        .unwrap();
+        validate_request(&request).unwrap();
+        let segment = Segment {
+            start_seconds: 0.0,
+            end_seconds: 1.0,
+        };
+        let args = segment_render_args(&request, &segment, "", &output, None);
+        let result = Command::new("ffmpeg").args(args).output().await.unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let decoded = ffmpeg(&["-i", output.to_str().unwrap(), "-f", "null", "-"]).await;
+        let info = String::from_utf8_lossy(&decoded.stderr);
+        assert!(
+            info.contains("pcm_s24be") && info.contains("96000 Hz, stereo"),
+            "{info}"
+        );
+    }
+
     #[tokio::test]
     #[ignore = "Requires FFmpeg on PATH"]
     async fn ffmpeg_autosplit_silence_and_manual_export_are_accurate() {
@@ -2693,34 +2919,58 @@ pub async fn analyze_waveform<R: Runtime>(
 ) -> Result<WaveformLevelsResponse, String> {
     let (pid, cancelled) = state.register(&id)?;
     let result = async {
-        let cache = app
-            .path()
-            .app_cache_dir()
-            .map_err(|e| e.to_string())?
-            .join("waveforms");
-        fs::create_dir_all(&cache).map_err(|e| e.to_string())?;
-        let path = cache.join(format!("levels-v1-{}.json", waveform_cache_key(&inputPath)));
-        if let Ok(bytes) = fs::read(&path) {
-            if let Ok(levels) = serde_json::from_slice::<WaveformLevelsResponse>(&bytes) {
-                return Ok(levels);
-            }
-        }
         let ffmpeg = resolve_ffmpeg_path(&app)?;
-        let levels = measure_waveform_levels(&ffmpeg, &inputPath, &pid, &cancelled).await?;
-        // Cache write is optional. A failed cache write must not block editing.
-        if let Ok(bytes) = serde_json::to_vec(&levels) {
-            if let Ok(staging) = reserve_staging_path(&path) {
-                if fs::write(&staging, bytes).is_ok() {
-                    let _ = fs::rename(&staging, &path);
-                }
-                let _ = fs::remove_file(&staging);
-            }
-        }
-        Ok(levels)
+        cached_waveform_levels(
+            &ffmpeg,
+            &inputPath,
+            waveform_cache_dir(&app).as_deref(),
+            &pid,
+            &cancelled,
+        )
+        .await
     }
     .await;
     state.remove(&id);
     result
+}
+
+fn waveform_cache_dir<R: Runtime>(app: &AppHandle<R>) -> Option<PathBuf> {
+    app.path()
+        .app_cache_dir()
+        .ok()
+        .map(|path| path.join("waveforms"))
+}
+
+async fn cached_waveform_levels(
+    ffmpeg: &Path,
+    input: &str,
+    cache: Option<&Path>,
+    pid: &Arc<Mutex<Option<u32>>>,
+    cancelled: &Arc<AtomicBool>,
+) -> Result<WaveformLevelsResponse, String> {
+    let path = cache.map(|dir| dir.join(format!("levels-v2-{}.json", waveform_cache_key(input))));
+    if let Some(levels) = path
+        .as_ref()
+        .and_then(|path| fs::read(path).ok())
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+    {
+        return Ok(levels);
+    }
+    let levels = measure_waveform_levels(ffmpeg, input, pid, cancelled).await?;
+    // A failed cache write must not block editing.
+    if let Some(path) = path {
+        if fs::create_dir_all(path.parent().unwrap()).is_ok() {
+            if let Ok(bytes) = serde_json::to_vec(&levels) {
+                if let Ok(staging) = reserve_staging_path(&path) {
+                    if fs::write(&staging, bytes).is_ok() {
+                        let _ = fs::rename(&staging, &path);
+                    }
+                    let _ = fs::remove_file(&staging);
+                }
+            }
+        }
+    }
+    Ok(levels)
 }
 
 async fn measure_waveform_levels(
@@ -2731,7 +2981,7 @@ async fn measure_waveform_levels(
 ) -> Result<WaveformLevelsResponse, String> {
     let mut command = Command::new(ffmpeg);
     command.args(["-hide_banner", "-nostdin", "-loglevel", "error", "-i", input, "-map", "0:a:0", "-vn",
-        "-af", "aresample=48000,asetnsamples=n=960:p=0,astats=metadata=1:reset=1:measure_perchannel=none:measure_overall=Peak_level+RMS_level,ametadata=print:file=-", "-f", "null", "-"])
+        "-af", "aresample=48000:async=1:first_pts=0,asetnsamples=n=960:p=0,astats=metadata=1:reset=1:measure_perchannel=none:measure_overall=Peak_level+RMS_level,ametadata=print:file=-", "-f", "null", "-"])
         .stdout(Stdio::piped()).stderr(Stdio::piped());
     if cancelled.load(Ordering::SeqCst) {
         return Err("Cancelled by user".into());

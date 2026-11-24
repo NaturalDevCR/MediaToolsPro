@@ -43,6 +43,7 @@ fn reveal_path(path: String) -> Result<(), String> {
 }
 
 mod binaries;
+mod encoding;
 mod jobs;
 mod media;
 
@@ -60,6 +61,7 @@ pub fn run() {
             media::probe_media,
             media::analyze_waveform,
             media::preview_segments,
+            media::analyze_split,
             media::render_split_comparison,
             media::remove_split_comparison,
             media::render_waveform_preview,

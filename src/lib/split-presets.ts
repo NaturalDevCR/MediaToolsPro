@@ -1,8 +1,8 @@
-import type { SplitMode, SplitNormalization } from "../types/jobs";
+import type { ExportEncoding, SilenceSensitivity, SplitMode, SplitNormalization } from "../types/jobs";
 
 export const splitPresetsKey = "mediatoolspro.split.presets.v1";
-export const audioFormats = ["wav", "flac", "mp3", "m4a", "ogg", "opus"];
-export const videoFormats = ["mp4", "mkv", "webm", ...audioFormats];
+export const audioFormats = ["wav", "flac", "aiff", "mp3", "m4a", "aac", "ogg", "opus"];
+export const videoFormats = ["mp4", "mkv", "mov", "webm", ...audioFormats];
 
 export interface SplitPreset {
   id: string;
@@ -12,6 +12,9 @@ export interface SplitPreset {
   snapToPause: boolean;
   pauseWindow: number;
   snapMinSilence: number;
+  autoSilence?: boolean;
+  sensitivity?: SilenceSensitivity;
+  scanAutomatically?: boolean;
   thresholdDb: number;
   minSilence: number;
   minSegment: number;
@@ -21,6 +24,7 @@ export interface SplitPreset {
   loudness: number;
   truePeak: number;
   format: string;
+  encoding?: ExportEncoding;
   outputNamePattern: string;
 }
 
@@ -43,12 +47,16 @@ export function isSplitPreset(value: unknown): value is SplitPreset {
     ["chapters", "silence", "duration", "manual"].includes(preset.mode ?? "") &&
     range(preset.duration, 0.001) && typeof preset.snapToPause === "boolean" &&
     range(preset.pauseWindow, 0.001, 60) && range(preset.snapMinSilence, 0.05, 60) &&
+    (preset.autoSilence === undefined || typeof preset.autoSilence === "boolean") &&
+    (preset.sensitivity === undefined || ["conservative", "balanced", "sensitive"].includes(preset.sensitivity)) &&
+    (preset.scanAutomatically === undefined || typeof preset.scanAutomatically === "boolean") &&
     range(preset.thresholdDb, -80, -5) &&
     range(preset.minSilence, 0.05, 60) && range(preset.minSegment, 0.001) &&
     range(preset.fadeIn, 0) && range(preset.fadeOut, 0) &&
     ["none", "before", "after"].includes(preset.normalization ?? "") &&
     range(preset.loudness, -30, -6) && range(preset.truePeak, -9, 0) &&
     videoFormats.includes(preset.format ?? "") &&
+    (preset.encoding === undefined || Boolean(preset.encoding) && typeof preset.encoding === "object") &&
     typeof preset.outputNamePattern === "string" &&
     validOutputNamePattern(preset.outputNamePattern);
 }

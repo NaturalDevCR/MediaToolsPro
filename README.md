@@ -56,7 +56,7 @@ La instalación del motor necesita internet. Una vez disponible FFmpeg, puedes p
 
 ### Forma de onda e inspección de silencios
 
-- **Zoom de 1× a 64×**, desplazamiento horizontal y regla temporal adaptativa. El editor dibuja los datos medidos del tramo visible.
+- **Zoom por duración visible**, desde la vista completa hasta tramos de segundos. **Ir al tiempo** centra la vista en un punto de la grabación.
 - Lectura de **pico y RMS en dBFS**, calculados en ventanas de **20 ms**. Mueve el puntero para inspeccionar; haz clic para situar el cursor.
 - En Split por silencios se muestra el umbral elegido, las pausas que cumplen la duración mínima y la duración aproximada de la pausa bajo el puntero.
 - Puedes aplicar un umbral basado en el pico medido con 3 dB de margen o una pausa mínima equivalente al 80 % de la pausa observada. Son puntos de partida que puedes ajustar.
@@ -64,7 +64,9 @@ La instalación del motor necesita internet. Una vez disponible FFmpeg, puedes p
 
 ### Exportación y formatos
 
-Audio: **WAV, FLAC, MP3, M4A, OGG y Opus**. Para Trim/Split de video también se ofrecen **MP4, MKV y WebM**. Normalize exporta audio.
+Audio: **WAV, FLAC, AIFF, MP3, M4A, AAC, OGG y Opus**. Para Trim/Split de video también se ofrecen **MP4, MKV, MOV y WebM**. Normalize exporta audio.
+
+Abre **Opciones de codificación** en el panel **Exportación** para ajustar frecuencia, canales y las opciones compatibles con el formato. Entre ellas están la tasa de bits, la profundidad PCM, la compresión FLAC, la calidad Vorbis y la calidad de video.
 
 Puedes guardar junto al archivo de origen o en una carpeta personalizada. La cola admite **dos tareas simultáneas**, cancelación, reintentos, historial y acceso a la carpeta de resultados. Si cierras la app durante una tarea, aparecerá como interrumpida en la siguiente sesión y podrás reintentarla.
 
@@ -84,7 +86,7 @@ Los originales se conservan. Las exportaciones usan nombres disponibles y no sob
 Selecciona un método de división.
 
 - **Por capítulos:** pulsa **Leer capítulos**. El archivo debe contener capítulos incrustados. Si faltan, la aplicación lo indica; puedes elegir silencios o cortes manuales.
-- **Por silencios:** mide una pausa en la onda, ajusta **umbral**, **pausa mínima** y **segmento mínimo**, y pulsa **Detectar silencios**. Los cortes se colocan en el centro de las pausas válidas.
+- **Por silencios:** la detección automática estima el umbral a partir de los niveles del tramo seleccionado. Ajusta **Sensibilidad** y **Segmento mínimo** y pulsa **Detectar silencios**. Puedes activar el análisis al abrir archivos o cambiar ajustes, o pasar a detección manual para introducir umbral y pausa mínima. Los cortes se colocan en el centro de las pausas válidas.
 - **Por duración:** introduce un intervalo en segundos o en `mm:ss.mmm` y pulsa **Generar segmentos**. Los cortes se cuentan desde el inicio de la selección y se conserva el tramo final más corto. Activa **Buscar una pausa cerca de cada corte** y configura la ventana, la pausa mínima y el umbral. Si falta una pausa en la ventana, se usa el tiempo original del corte.
 - **Manual:** haz doble clic en la onda, añade un corte en el cursor o introduce un tiempo exacto. Puedes retirar marcas de la lista.
 
@@ -103,7 +105,9 @@ En **Exportación** puedes usar un patrón como `Pista-{numero} - {archivo}`. La
 3. Ajusta el techo de true peak, el formato y la carpeta de salida.
 4. Pulsa **Normalizar archivos** y revisa el avance en Exportaciones.
 
-La primera pasada mide la sonoridad; la segunda aplica el ajuste. La salida se genera a **48 kHz**, con un rango objetivo de **11 LU**. FFmpeg puede aplicar normalización dinámica cuando el objetivo requiere limitar picos o reducir el rango. El techo de true peak se aplica antes de la codificación: los formatos con pérdida pueden introducir pequeñas variaciones.
+La primera pasada mide la sonoridad; la segunda aplica el ajuste. La frecuencia predeterminada es **48 kHz**, con un rango objetivo de **11 LU**. FFmpeg puede aplicar normalización dinámica cuando el objetivo requiere limitar picos o reducir el rango. El techo de true peak se aplica antes de la codificación: los formatos con pérdida pueden introducir pequeñas variaciones.
+
+El selector **Español / English** de la cabecera se aplica al estudio completo y conserva tu elección entre sesiones.
 
 ### Atajos del editor
 

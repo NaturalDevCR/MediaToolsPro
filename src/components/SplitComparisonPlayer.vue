@@ -3,6 +3,7 @@ import { onBeforeUnmount, ref } from "vue";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { Pause, Play } from "lucide-vue-next";
 import type { SplitComparison } from "../types/jobs";
+import { t } from "../lib/i18n";
 
 const props = defineProps<{ comparison: SplitComparison; duration: number }>();
 const emit = defineEmits<{ play: []; error: [message: string] }>();
@@ -67,19 +68,19 @@ onBeforeUnmount(() => {
 <template>
   <div class="comparison-player">
     <div class="comparison-actions">
-      <button class="icon-button" :aria-label="playing ? 'Pausar comparación' : 'Reproducir comparación'"
+      <button class="icon-button" :aria-label="t(playing ? 'Pausar comparación' : 'Reproducir comparación')"
         @click="playing ? pause() : play()">
         <Pause v-if="playing" :size="15" /><Play v-else :size="15" />
       </button>
-      <div class="split-mode-tabs" aria-label="Versión del audio">
+      <div class="split-mode-tabs" :aria-label="t('Versión del audio')">
         <button :class="{ active: active === 'original' }" :aria-pressed="active === 'original'"
           @click="play('original')">A · Original</button>
         <button :class="{ active: active === 'processed' }" :aria-pressed="active === 'processed'"
-          @click="play('processed')">B · Procesado</button>
+          @click="play('processed')">{{ t("B · Procesado") }}</button>
       </div>
     </div>
     <input type="range" min="0" :max="duration" step="0.001" :value="position"
-      aria-label="Posición de la comparación" @input="seek" />
+      :aria-label="t('Posición de la comparación')" @input="seek" />
     <audio ref="original" preload="metadata" :src="convertFileSrc(comparison.originalPath)"
       @play="sync('original')" @pause="sync('original')" @timeupdate="sync('original')" @ended="sync('original')"
       @error="emit('error', 'No se pudo cargar la versión original.')" />
