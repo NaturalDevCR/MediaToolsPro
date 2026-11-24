@@ -114,11 +114,8 @@ select {
 .brand-symbol {
   width: 32px;
   height: 32px;
-  display: grid;
-  place-items: center;
-  border-radius: 9px;
-  color: #e0ffec;
-  background: #164e3e;
+  display: block;
+  flex-shrink: 0;
 }
 .brand span span {
   color: var(--muted);

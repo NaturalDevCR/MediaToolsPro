@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="src-tauri/icons/128x128@2x.png" width="88" alt="MediaToolsPro" />
+  <img src="src-tauri/icons/mediatoolspro/128x128@2x.png" width="88" alt="MediaToolsPro" />
 </p>
 
 <h1 align="center">MediaToolsPro</h1>

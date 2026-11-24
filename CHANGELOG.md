@@ -1,5 +1,9 @@
 # Historial de cambios
 
+## 0.4.1 — 2026-11-23
+
+- Nuevo icono de MediaToolsPro en el estudio y en los instaladores de escritorio.
+
 ## 0.4.0 — 2026-11-23
 
 - División por duración fija con ajuste opcional a pausas cercanas.

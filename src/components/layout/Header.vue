@@ -1,12 +1,12 @@
 <script setup lang="ts">
 import {
-  AudioLines,
   Sun,
   Moon,
   Settings,
   FileText,
   SlidersHorizontal,
 } from "lucide-vue-next";
+import appIcon from "../../../src-tauri/icons/mediatoolspro/128x128.png";
 defineProps<{ currentTab: string; isDark: boolean }>();
 defineEmits<{ "update:currentTab": [tab: string]; toggleTheme: [] }>();
 const tabs = [
@@ -18,7 +18,7 @@ const tabs = [
 <template>
   <header class="app-header">
     <div class="brand">
-      <div class="brand-symbol"><AudioLines :size="20" /></div>
+      <img class="brand-symbol" :src="appIcon" alt="" width="32" height="32" />
       <span>MediaTools<span>Pro</span></span>
     </div>
     <nav class="header-nav" aria-label="Navegación principal">
