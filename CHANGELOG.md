@@ -1,5 +1,12 @@
 # Historial de cambios
 
+## 0.4.0 — 2026-11-23
+
+- División por duración fija con ajuste opcional a pausas cercanas.
+- Fades por segmento en los cuatro métodos de Split y normalización antes o después de dividir.
+- Preescucha A/B del audio original y procesado.
+- Presets locales de Split y nombres de exportación con `{archivo}` y `{numero}`.
+
 ## 0.3.0 — 2026-11-21
 
 ### Añadido

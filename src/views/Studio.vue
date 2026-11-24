@@ -34,6 +34,7 @@ import {
   X,
 } from "lucide-vue-next";
 import QueueItem from "../components/QueueItem.vue";
+import SplitComparisonPlayer from "../components/SplitComparisonPlayer.vue";
 import {
   basename,
   cancelItem,
@@ -49,7 +50,9 @@ import type {
   MediaProbeResponse,
   ProcessJobRequest,
   Segment,
+  SplitComparison,
   SplitMode,
+  SplitNormalization,
   Tool,
   WaveformPreviewResponse,
   WaveformLevelsResponse,
@@ -61,6 +64,15 @@ import {
   quietRegions,
   suggestThreshold,
 } from "../lib/waveform";
+import {
+  audioFormats,
+  isSplitPreset,
+  parseSplitPresets,
+  splitPresetsKey,
+  validOutputNamePattern,
+  videoFormats,
+  type SplitPreset,
+} from "../lib/split-presets";
 
 const props = defineProps<{ active: boolean }>();
 
@@ -347,9 +359,62 @@ const loop = ref(false);
 const zoom = ref(1);
 const start = ref("00:00.000");
 const end = ref("");
-const fadeIn = ref(0);
-const fadeOut = ref(0);
-const splitMode = ref<SplitMode>("chapters");
+const trimFades = ref({ in: 0, out: 0 });
+const splitFades = ref({ in: 0, out: 0 });
+const fades = computed(() =>
+  tool.value === "split" ? splitFades.value : trimFades.value,
+);
+const splitMode = ref<Exclude<SplitMode, "none">>("chapters");
+const splitDuration = ref("03:00");
+const splitDurationSeconds = computed(() => parse(splitDuration.value));
+const snapToPause = ref(false);
+const pauseWindow = ref(5);
+const snapMinSilence = ref(0.3);
+const outputNamePattern = ref("");
+const storedPresets = ref(parseSplitPresets(localStorage.getItem(splitPresetsKey)));
+const presetChoice = ref("");
+const presetName = ref("");
+const presetStatus = ref("");
+const comparison = ref<SplitComparison>();
+const comparisonSegment = ref<Segment>();
+const comparisonIndex = ref(0);
+const comparisonPending = ref(false);
+const comparisonError = ref("");
+const comparisonPlayer = ref<InstanceType<typeof SplitComparisonPlayer>>();
+let comparisonId = "";
+const splitNormalization = ref<SplitNormalization>("none");
+const splitModes = {
+  chapters: {
+    label: "Por capítulos",
+    help: "Usa los capítulos incrustados en el archivo local.",
+    action: "Leer capítulos",
+  },
+  silence: {
+    label: "Por silencios",
+    help: "Coloca un corte en el centro de cada silencio que cumpla los parámetros.",
+    action: "Detectar silencios",
+  },
+  duration: {
+    label: "Por duración",
+    help: "Divide desde el inicio de la selección y conserva el tramo final aunque sea más corto.",
+    action: "Generar segmentos",
+  },
+  manual: {
+    label: "Manual",
+    help: "Haz doble clic en la onda, usa el cursor o escribe un tiempo exacto para añadir cada corte.",
+  },
+};
+const splitNormalizationOptions = {
+  none: { label: "Desactivada", help: "" },
+  before: {
+    label: "Antes de dividir",
+    help: "Mide y ajusta toda la selección en conjunto. Los fades se aplican al exportar cada segmento.",
+  },
+  after: {
+    label: "Después de dividir",
+    help: "Mide y ajusta cada segmento por separado con sus fades ya aplicados.",
+  },
+};
 const markers = ref<number[]>([]);
 const markerInput = ref("");
 const thresholdDb = ref(-35);
@@ -362,6 +427,15 @@ const destination = ref("source");
 const outputDir = ref("");
 const loudness = ref(-16);
 const truePeak = ref(-1.5);
+const loudnessValid = computed(
+  () =>
+    Number.isFinite(loudness.value) &&
+    loudness.value >= -30 &&
+    loudness.value <= -6 &&
+    Number.isFinite(truePeak.value) &&
+    truePeak.value >= -9 &&
+    truePeak.value <= 0,
+);
 const presets = [
   { name: "Podcast", value: -16, hint: "Voz y contenido web" },
   { name: "Streaming", value: -14, hint: "Música y plataformas" },
@@ -412,7 +486,7 @@ function parse(value: string): number | null {
       return null;
     seconds = seconds * 60 + number;
   }
-  return seconds;
+  return Number.isFinite(seconds) ? seconds : null;
 }
 const startSeconds = computed(() => parse(start.value));
 const endSeconds = computed(() => parse(end.value));
@@ -427,6 +501,20 @@ const selectionValid = computed(
 const selectionDuration = computed(() =>
   selectionValid.value ? endSeconds.value! - startSeconds.value! : 0,
 );
+const durationSplitProblem = computed(() => {
+  if (splitMode.value !== "duration" || !selectionValid.value) return "";
+  const seconds = splitDurationSeconds.value;
+  if (seconds === null || seconds < 0.001)
+    return "Introduce una duración de al menos 0.001 s por segmento.";
+  const intervalMs = Math.round(seconds * 1000);
+  const selectionMs =
+    Math.round(endSeconds.value! * 1000) - Math.round(startSeconds.value! * 1000);
+  if (intervalMs >= selectionMs)
+    return "La duración por segmento debe ser menor que la selección.";
+  if (snapToPause.value && (!Number.isFinite(pauseWindow.value) || pauseWindow.value <= 0 || pauseWindow.value > 60))
+    return "Introduce una ventana de búsqueda mayor que 0 s y de hasta 60 s.";
+  return "";
+});
 const percent = (seconds: number) =>
   duration.value
     ? Math.max(0, Math.min(100, (seconds / duration.value) * 100))
@@ -457,9 +545,17 @@ const autoReviewed = computed(
 );
 const formats = computed(() =>
   selected.value?.probe?.mediaKind === "video" && tool.value !== "normalize"
-    ? ["mp4", "mkv", "webm", "wav", "flac", "mp3", "m4a"]
-    : ["wav", "flac", "mp3", "m4a", "ogg", "opus"],
+    ? videoFormats
+    : audioFormats,
 );
+const splitEffectProblem = computed(() => {
+  if (!Number.isFinite(splitFades.value.in) || !Number.isFinite(splitFades.value.out) ||
+      splitFades.value.in < 0 || splitFades.value.out < 0)
+    return "Introduce fades de entrada y salida de 0 s o más.";
+  if (splitNormalization.value !== "none" && !loudnessValid.value)
+    return "Revisa los objetivos de sonoridad y true peak.";
+  return "";
+});
 const exportProblem = computed(() => {
   if (!sources.value.length) return "Importa un archivo para empezar.";
   if (!queueReady.value)
@@ -469,14 +565,7 @@ const exportProblem = computed(() => {
   if (tool.value === "normalize") {
     if (sources.value.some((source) => !source.probe || source.error))
       return "Espera a que se verifiquen todos los archivos o retira los que tienen errores.";
-    if (
-      !Number.isFinite(loudness.value) ||
-      loudness.value < -30 ||
-      loudness.value > -6 ||
-      !Number.isFinite(truePeak.value) ||
-      truePeak.value < -9 ||
-      truePeak.value > 0
-    )
+    if (!loudnessValid.value)
       return "Revisa los objetivos de sonoridad y true peak.";
     return "";
   }
@@ -484,14 +573,23 @@ const exportProblem = computed(() => {
   if (!selectionValid.value)
     return "Revisa el inicio y el final de la selección.";
   if (
+    !Number.isFinite(fades.value.in) ||
+    !Number.isFinite(fades.value.out) ||
+    fades.value.in < 0 ||
+    fades.value.out < 0
+  )
+    return "Introduce fades de entrada y salida de 0 s o más.";
+  if (
     tool.value === "trim" &&
-    (!Number.isFinite(fadeIn.value) ||
-      !Number.isFinite(fadeOut.value) ||
-      fadeIn.value < 0 ||
-      fadeOut.value < 0 ||
-      fadeIn.value + fadeOut.value > selectionDuration.value)
+    fades.value.in + fades.value.out > selectionDuration.value
   )
     return "Los fades deben caber dentro de la selección.";
+  if (tool.value === "split") {
+    if (durationSplitProblem.value) return durationSplitProblem.value;
+    if (splitEffectProblem.value) return splitEffectProblem.value;
+    if (!validOutputNamePattern(outputNamePattern.value))
+      return "Incluye {numero} en el patrón de salida y evita caracteres reservados.";
+  }
   if (
     tool.value === "split" &&
     (!autoReviewed.value || segments.value.length < 2)
@@ -559,6 +657,7 @@ function seek(seconds: number) {
 }
 async function playRegion(regionStart: number, regionEnd: number) {
   if (!audio.value || !preview.value) return;
+  comparisonPlayer.value?.pause();
   playbackEnd = regionEnd;
   playbackStart = regionStart;
   seek(regionStart);
@@ -675,6 +774,12 @@ function resetSelection() {
   seek(0);
 }
 function baseRequest(path: string): ProcessJobRequest {
+  const isSplit = tool.value === "split";
+  const usePauses = isSplit && splitMode.value === "duration" && snapToPause.value;
+  const useSilence = isSplit && splitMode.value === "silence";
+  const normalize = tool.value === "normalize";
+  const useLoudness =
+    normalize || (isSplit && splitNormalization.value !== "none");
   return {
     inputPath: path,
     outputDir: destination.value === "custom" ? outputDir.value : undefined,
@@ -682,20 +787,165 @@ function baseRequest(path: string): ProcessJobRequest {
     trimStart:
       tool.value === "normalize" ? undefined : String(startSeconds.value),
     trimEnd: tool.value === "normalize" ? undefined : String(endSeconds.value),
-    normalize: tool.value === "normalize",
-    loudnessTargetLufs: loudness.value,
-    truePeakDbtp: truePeak.value,
+    normalize,
+    loudnessTargetLufs: useLoudness ? loudness.value : -16,
+    truePeakDbtp: useLoudness ? truePeak.value : -1.5,
     eq: { bass: 0, mid: 0, treble: 0 },
-    splitMode: "none",
+    splitMode: isSplit ? splitMode.value : "none",
+    splitDurationSeconds:
+      isSplit && splitMode.value === "duration"
+        ? splitDurationSeconds.value ?? undefined
+        : undefined,
+    splitPauseWindowSeconds: usePauses ? pauseWindow.value : undefined,
+    outputNamePattern: isSplit ? outputNamePattern.value.trim() || undefined : undefined,
+    splitNormalization: isSplit ? splitNormalization.value : "none",
     manualMarkers: [],
     silence: {
-      thresholdDb: thresholdDb.value,
-      minSilenceDuration: minSilence.value,
-      minSegmentDuration: minSegment.value,
+      thresholdDb: useSilence || usePauses ? thresholdDb.value : -35,
+      minSilenceDuration: usePauses ? snapMinSilence.value : useSilence ? minSilence.value : 1.5,
+      minSegmentDuration: useSilence ? minSegment.value : 20,
     },
-    fadeInDuration: tool.value === "trim" ? fadeIn.value : 0,
-    fadeOutDuration: tool.value === "trim" ? fadeOut.value : 0,
+    fadeInDuration: normalize ? 0 : fades.value.in,
+    fadeOutDuration: normalize ? 0 : fades.value.out,
   };
+}
+
+function applySplitPreset() {
+  const preset = storedPresets.value.find(({ id }) => id === presetChoice.value);
+  presetStatus.value = "";
+  presetName.value = preset?.name ?? "";
+  if (!preset) return;
+  splitMode.value = preset.mode;
+  splitDuration.value = time(preset.duration);
+  snapToPause.value = preset.snapToPause;
+  pauseWindow.value = preset.pauseWindow;
+  snapMinSilence.value = preset.snapMinSilence;
+  thresholdDb.value = preset.thresholdDb;
+  minSilence.value = preset.minSilence;
+  minSegment.value = preset.minSegment;
+  splitFades.value = { in: preset.fadeIn, out: preset.fadeOut };
+  splitNormalization.value = preset.normalization;
+  loudness.value = preset.loudness;
+  truePeak.value = preset.truePeak;
+  outputNamePattern.value = preset.outputNamePattern;
+  const compatible = !selected.value?.probe || formats.value.includes(preset.format);
+  format.value = compatible ? preset.format : "wav";
+  presetStatus.value = compatible
+    ? `Aplicado: ${preset.name}.`
+    : `Aplicado: ${preset.name}. Se usará WAV para este archivo.`;
+}
+
+function persistSplitPresets(presets: SplitPreset[]) {
+  try {
+    localStorage.setItem(splitPresetsKey, JSON.stringify(presets));
+    storedPresets.value = presets;
+    return true;
+  } catch {
+    presetStatus.value = "No se pudieron guardar los presets en este equipo.";
+    return false;
+  }
+}
+
+const matchingPreset = computed(() => storedPresets.value.find(
+  ({ name }) => name.toLocaleLowerCase() === presetName.value.trim().toLocaleLowerCase(),
+));
+
+function saveSplitPreset() {
+  const id = matchingPreset.value?.id ?? crypto.randomUUID();
+  const preset: SplitPreset = {
+    id,
+    name: presetName.value.trim(),
+    mode: splitMode.value,
+    duration: splitDurationSeconds.value ?? 0,
+    snapToPause: snapToPause.value,
+    pauseWindow: pauseWindow.value,
+    snapMinSilence: snapMinSilence.value,
+    thresholdDb: thresholdDb.value,
+    minSilence: minSilence.value,
+    minSegment: minSegment.value,
+    fadeIn: splitFades.value.in,
+    fadeOut: splitFades.value.out,
+    normalization: splitNormalization.value,
+    loudness: loudness.value,
+    truePeak: truePeak.value,
+    format: format.value,
+    outputNamePattern: outputNamePattern.value.trim(),
+  };
+  if (!isSplitPreset(preset)) {
+    presetStatus.value = "Revisa el nombre y los ajustes de Split antes de guardar.";
+    return;
+  }
+  const next = matchingPreset.value
+    ? storedPresets.value.map((item) => item.id === id ? preset : item)
+    : [...storedPresets.value, preset];
+  if (persistSplitPresets(next)) {
+    presetChoice.value = id;
+    presetStatus.value = `Guardado: ${preset.name}.`;
+  }
+}
+
+function deleteSplitPreset() {
+  if (persistSplitPresets(storedPresets.value.filter(({ id }) => id !== presetChoice.value))) {
+    presetChoice.value = "";
+    presetName.value = "";
+    presetStatus.value = "Preset eliminado.";
+  }
+}
+
+function splitRequest(path: string, splitSegments: Segment[]) {
+  const request = baseRequest(path);
+  request.splitMode = "manual";
+  request.splitDurationSeconds = undefined;
+  request.splitPauseWindowSeconds = undefined;
+  request.manualMarkers = splitSegments.slice(1).map(({ startSeconds }) => startSeconds);
+  return request;
+}
+
+function invalidateComparison() {
+  const id = comparisonId;
+  const pending = comparisonPending.value;
+  const ready = Boolean(comparison.value);
+  comparisonPlayer.value?.pause();
+  comparisonId = "";
+  comparison.value = undefined;
+  comparisonSegment.value = undefined;
+  comparisonPending.value = false;
+  comparisonError.value = "";
+  if (pending) void invoke("cancel_job", { id }).catch(() => {});
+  if (ready) void nextTick().then(() => invoke("remove_split_comparison", { id })).catch(() => {});
+}
+
+async function compareSegment(segment: Segment, index: number) {
+  invalidateComparison();
+  comparisonSegment.value = segment;
+  comparisonIndex.value = index + 1;
+  if (splitEffectProblem.value) {
+    comparisonError.value = splitEffectProblem.value;
+    return;
+  }
+  stopPlayback();
+  const id = crypto.randomUUID();
+  comparisonId = id;
+  comparisonPending.value = true;
+  try {
+    const result = await invoke<SplitComparison>("render_split_comparison", {
+      request: {
+        ...splitRequest(selectedPath.value, segments.value),
+        id,
+        outputNamePattern: undefined,
+      },
+      segment,
+    });
+    if (id !== comparisonId) {
+      await invoke("remove_split_comparison", { id });
+      return;
+    }
+    comparison.value = result;
+  } catch (error) {
+    if (id === comparisonId) comparisonError.value = String(error);
+  } finally {
+    if (id === comparisonId) comparisonPending.value = false;
+  }
 }
 async function invalidateAnalysis() {
   analysisToken++;
@@ -713,7 +963,11 @@ async function invalidateAnalysis() {
 }
 async function analyze() {
   if (!selectionValid.value || !selectedPath.value) return;
-  await invalidateAnalysis();
+  if (durationSplitProblem.value) {
+    error.value = durationSplitProblem.value;
+    return;
+  }
+  void invalidateAnalysis();
   const token = ++analysisToken;
   const id = crypto.randomUUID();
   analysisId = id;
@@ -724,7 +978,12 @@ async function analyze() {
       request: {
         ...baseRequest(selectedPath.value),
         id,
-        splitMode: splitMode.value,
+        splitNormalization: "none",
+        outputNamePattern: undefined,
+        loudnessTargetLufs: -16,
+        truePeakDbtp: -1.5,
+        fadeInDuration: 0,
+        fadeOutDuration: 0,
       },
     });
     if (token !== analysisToken || disposed) return;
@@ -742,7 +1001,7 @@ async function analyze() {
   }
 }
 function editDetectedCuts() {
-  const cuts = analyzedSegments.value
+  const cuts = segments.value
     .slice(1)
     .map((segment) => segment.startSeconds);
   splitMode.value = "manual";
@@ -766,16 +1025,9 @@ function exportJobs() {
       tool.value === "normalize"
         ? sources.value.map((source) => source.path)
         : [selectedPath.value];
-    const requests = paths.map((path) => {
-      const request = baseRequest(path);
-      if (tool.value === "split") {
-        request.splitMode = "manual";
-        request.manualMarkers = segments.value
-          .slice(1)
-          .map((segment) => segment.startSeconds);
-      }
-      return request;
-    });
+    const requests = paths.map((path) => tool.value === "split"
+      ? splitRequest(path, segments.value)
+      : baseRequest(path));
     enqueue(requests, tool.value);
     notice.value = `${requests.length} tarea(s) añadida(s) a la cola.`;
     showQueue.value = true;
@@ -886,21 +1138,33 @@ watch(selectedPath, async (path) => {
 watch(duration, (value) => {
   end.value = value ? time(value) : "";
 });
-watch([start, end, splitMode, thresholdDb, minSilence, minSegment], () => {
-  void invalidateAnalysis();
-});
+watch(
+  [start, end, splitMode, splitDuration, snapToPause, pauseWindow, snapMinSilence, thresholdDb, minSilence, minSegment],
+  () => void invalidateAnalysis(),
+);
 watch([start, end], stopPlayback);
 watch(showQueue, (value) => {
-  if (value) stopPlayback();
+  if (value) {
+    stopPlayback();
+    invalidateComparison();
+  }
 });
-watch([tool, selectedPath], () => {
-  if (!formats.value.includes(format.value)) format.value = formats.value[0];
+watch([tool, selectedPath, formats], () => {
+  if (selected.value?.probe && !formats.value.includes(format.value)) format.value = formats.value[0];
   stopPlayback();
 });
 watch(
+  [tool, selectedPath, start, end, segments, () => splitFades.value.in,
+    () => splitFades.value.out, splitNormalization, loudness, truePeak],
+  invalidateComparison,
+);
+watch(
   () => props.active,
   (active) => {
-    if (!active) stopPlayback();
+    if (!active) {
+      stopPlayback();
+      invalidateComparison();
+    }
   },
 );
 watch(
@@ -961,6 +1225,7 @@ onMounted(async () => {
 });
 onUnmounted(() => {
   disposed = true;
+  invalidateComparison();
   void cancelPreview();
   void cancelLevels();
   resizeObserver?.disconnect();
@@ -1185,56 +1450,6 @@ onUnmounted(() => {
                     ajuste. El límite de true peak se usa en la normalización.
                   </p>
                 </div>
-              </div>
-              <div class="preset-grid">
-                <button
-                  v-for="preset in presets"
-                  :key="preset.value"
-                  class="preset-card"
-                  :class="{ selected: loudness === preset.value }"
-                  @click="loudness = preset.value"
-                >
-                  <span
-                    >{{ preset.name
-                    }}<Check
-                      v-if="loudness === preset.value"
-                      :size="15" /></span
-                  ><strong>{{ preset.value }} <small>LUFS</small></strong>
-                  <p>{{ preset.hint }}</p>
-                </button>
-              </div>
-              <div class="fields-row loudness-fields">
-                <label
-                  >Sonoridad integrada
-                  <div class="unit-input">
-                    <input
-                      v-model.number="loudness"
-                      type="number"
-                      min="-30"
-                      max="-6"
-                      step="0.5"
-                    /><span>LUFS</span>
-                  </div></label
-                ><label
-                  >Techo de true peak
-                  <div class="unit-input">
-                    <input
-                      v-model.number="truePeak"
-                      type="number"
-                      min="-9"
-                      max="0"
-                      step="0.1"
-                    /><span>dBTP</span>
-                  </div></label
-                >
-              </div>
-              <div class="method-note">
-                <Layers :size="18" />
-                <p>
-                  Medición individual por archivo · rango objetivo de 11 LU ·
-                  salida a 48 kHz. Si el objetivo exige limitar picos o reducir
-                  el rango, el motor aplica normalización dinámica.
-                </p>
               </div>
             </template>
             <template v-else>
@@ -1546,69 +1761,85 @@ onUnmounted(() => {
                   · Shift 0.1 s</span
                 >
               </div>
-              <div v-if="tool === 'trim'" class="fade-section">
-                <div class="fields-row">
-                  <label
-                    >Fade de entrada
-                    <div class="unit-input">
-                      <input
-                        v-model.number="fadeIn"
-                        type="number"
-                        min="0"
-                        :max="selectionDuration / 2"
-                        step="0.1"
-                      /><span>s</span>
-                    </div></label
-                  ><label
-                    >Fade de salida
-                    <div class="unit-input">
-                      <input
-                        v-model.number="fadeOut"
-                        type="number"
-                        min="0"
-                        :max="selectionDuration / 2"
-                        step="0.1"
-                      /><span>s</span>
-                    </div></label
-                  >
-                </div>
-                <p class="panel-footnote">
-                  Suaviza los bordes del recorte. Usa 0 para conservar el corte
-                  directo.
-                </p>
-              </div>
               <template v-if="tool === 'split'">
                 <div class="split-section">
+                  <div class="fields-row split-preset-picker">
+                    <label>
+                      Preset de Split
+                      <select v-model="presetChoice" aria-label="Preset de Split" @change="applySplitPreset">
+                        <option value="">Elegir preset guardado</option>
+                        <option v-for="preset in storedPresets" :key="preset.id" :value="preset.id">
+                          {{ preset.name }}
+                        </option>
+                      </select>
+                    </label>
+                    <button
+                      v-if="presetChoice"
+                      class="text-button"
+                      type="button"
+                      @click="deleteSplitPreset"
+                    >
+                      Eliminar preset
+                    </button>
+                  </div>
                   <div class="split-mode-tabs" aria-label="Método de división">
                     <button
-                      :class="{ active: splitMode === 'chapters' }"
-                      @click="splitMode = 'chapters'"
+                      v-for="(mode, key) in splitModes"
+                      :key="key"
+                      :class="{ active: splitMode === key }"
+                      :aria-pressed="splitMode === key"
+                      @click="splitMode = key"
                     >
-                      Por capítulos</button
-                    ><button
-                      :class="{ active: splitMode === 'silence' }"
-                      @click="splitMode = 'silence'"
-                    >
-                      Por silencios</button
-                    ><button
-                      :class="{ active: splitMode === 'manual' }"
-                      @click="splitMode = 'manual'"
-                    >
-                      Manual
+                      {{ mode.label }}
                     </button>
                   </div>
                   <p class="split-help">
-                    {{
-                      splitMode === "chapters"
-                        ? "Usa los capítulos incrustados en el archivo local. Si no hay capítulos, puedes elegir silencios o marcar tus propios cortes."
-                        : splitMode === "silence"
-                          ? "Detecta las pausas y coloca un corte en el centro de cada silencio que cumpla los parámetros."
-                          : "Haz doble clic en la onda, usa el cursor o escribe un tiempo exacto para añadir cada corte."
-                    }}
+                    {{ splitModes[splitMode].help }}
                   </p>
+                  <div v-if="splitMode === 'duration'" class="fields-row split-parameters">
+                    <label>
+                      Duración por segmento
+                      <input
+                        v-model="splitDuration"
+                        class="time-input"
+                        placeholder="03:00.000"
+                        @keydown.enter="analyze"
+                      />
+                      <small>Segundos o mm:ss.mmm</small>
+                    </label>
+                  </div>
+                  <template v-if="splitMode === 'duration'">
+                    <label class="split-snap-toggle">
+                      <input v-model="snapToPause" type="checkbox" />
+                      Buscar una pausa cerca de cada corte
+                    </label>
+                    <div v-if="snapToPause" class="fields-row split-parameters">
+                      <label>
+                        Ventana ±
+                        <div class="unit-input">
+                          <input v-model.number="pauseWindow" type="number" min="0.001" max="60" step="0.1" />
+                          <span>s</span>
+                        </div>
+                      </label>
+                      <label>
+                        Pausa mínima
+                        <div class="unit-input">
+                          <input v-model.number="snapMinSilence" type="number" min="0.05" max="60" step="0.05" />
+                          <span>s</span>
+                        </div>
+                      </label>
+                      <label>
+                        Umbral
+                        <div class="unit-input">
+                          <input v-model.number="thresholdDb" type="number" min="-80" max="-5" step="1" />
+                          <span>dB</span>
+                        </div>
+                      </label>
+                    </div>
+                  </template>
                   <div
                     v-if="splitMode === 'silence'"
-                    class="fields-row silence-fields"
+                    class="fields-row split-parameters"
                   >
                     <label
                       >Umbral
@@ -1681,9 +1912,7 @@ onUnmounted(() => {
                     /><Activity v-else :size="16" />{{
                       analysisBusy
                         ? "Analizando archivo…"
-                        : splitMode === "chapters"
-                          ? "Leer capítulos"
-                          : "Detectar silencios"
+                        : splitModes[splitMode].action
                     }}
                   </button>
                   <button
@@ -1715,24 +1944,11 @@ onUnmounted(() => {
                   </div>
                 </div>
                 <div
-                  v-if="
-                    segments.length &&
-                    (splitMode === 'manual' || analyzedSegments.length)
-                  "
+                  v-if="segments.length"
                   class="segment-review"
                 >
                   <div class="section-top">
-                    <h3>
-                      {{ segments.length }} segmento(s)
-                      <small
-                        >·
-                        {{
-                          splitMode === "manual"
-                            ? "cortes manuales"
-                            : "revisión del autosplit"
-                        }}</small
-                      >
-                    </h3>
+                    <h3>{{ segments.length }} segmento(s)</h3>
                     <button
                       v-if="splitMode !== 'manual' && segments.length > 1"
                       class="text-button"
@@ -1768,10 +1984,144 @@ onUnmounted(() => {
                       >
                         <Play :size="14" />
                       </button>
+                      <button
+                        class="comparison-button"
+                        :disabled="!isTauri()"
+                        :aria-label="`Comparar segmento ${i + 1}`"
+                        :aria-pressed="comparisonSegment === segment"
+                        @click="compareSegment(segment, i)"
+                      >
+                        A/B
+                      </button>
                     </div>
+                  </div>
+                  <div v-if="comparisonSegment" class="segment-comparison">
+                    <div class="comparison-title">
+                      <h3>Preescucha A/B · segmento {{ comparisonIndex }}</h3>
+                      <button class="icon-button" aria-label="Cerrar comparación" @click="invalidateComparison">
+                        <X :size="14" />
+                      </button>
+                    </div>
+                    <p v-if="comparisonPending" class="comparison-status" role="status">
+                      <LoaderCircle :size="14" class="spin" /> Preparando el audio original y procesado…
+                    </p>
+                    <p v-if="comparisonError" class="comparison-status error-text" role="alert">{{ comparisonError }}</p>
+                    <SplitComparisonPlayer v-if="comparison" ref="comparisonPlayer"
+                      :comparison="comparison"
+                      :duration="comparisonSegment.endSeconds - comparisonSegment.startSeconds"
+                      @play="stopPlayback" @error="comparisonError = $event" />
                   </div>
                 </div>
               </template>
+            </template>
+            <div v-if="tool !== 'normalize'" class="fade-section">
+              <div class="fields-row">
+                <label>
+                  Fade de entrada
+                  <div class="unit-input">
+                    <input
+                      v-model.number="fades.in"
+                      type="number"
+                      min="0"
+                      :max="tool === 'trim' ? selectionDuration / 2 : undefined"
+                      step="0.001"
+                    /><span>s</span>
+                  </div>
+                </label>
+                <label>
+                  Fade de salida
+                  <div class="unit-input">
+                    <input
+                      v-model.number="fades.out"
+                      type="number"
+                      min="0"
+                      :max="tool === 'trim' ? selectionDuration / 2 : undefined"
+                      step="0.001"
+                    /><span>s</span>
+                  </div>
+                </label>
+              </div>
+              <p class="panel-footnote">
+                {{
+                  tool === "split"
+                    ? "Los fades se aplican al audio de cada segmento. Cada fade dura como máximo la mitad del segmento. Usa 0 para desactivarlo."
+                    : "Suaviza los bordes del recorte. Usa 0 para conservar el corte directo."
+                }}
+              </p>
+            </div>
+            <div v-if="tool === 'split'" class="split-section">
+              <div class="fields-row">
+                <label>
+                  Normalización de sonoridad
+                  <select v-model="splitNormalization">
+                    <option
+                      v-for="(option, key) in splitNormalizationOptions"
+                      :key="key"
+                      :value="key"
+                    >
+                      {{ option.label }}
+                    </option>
+                  </select>
+                </label>
+              </div>
+              <p v-if="splitNormalization !== 'none'" class="split-help normalization-help">
+                {{ splitNormalizationOptions[splitNormalization].help }}
+              </p>
+            </div>
+            <template
+              v-if="tool === 'normalize' || (tool === 'split' && splitNormalization !== 'none')"
+            >
+              <div class="preset-grid">
+                <button
+                  v-for="preset in presets"
+                  :key="preset.value"
+                  class="preset-card"
+                  :class="{ selected: loudness === preset.value }"
+                  :aria-pressed="loudness === preset.value"
+                  @click="loudness = preset.value"
+                >
+                  <span
+                    >{{ preset.name
+                    }}<Check
+                      v-if="loudness === preset.value"
+                      :size="15" /></span
+                  ><strong>{{ preset.value }} <small>LUFS</small></strong>
+                  <p>{{ preset.hint }}</p>
+                </button>
+              </div>
+              <div class="fields-row loudness-fields">
+                <label
+                  >Sonoridad integrada
+                  <div class="unit-input">
+                    <input
+                      v-model.number="loudness"
+                      type="number"
+                      min="-30"
+                      max="-6"
+                      step="0.5"
+                    /><span>LUFS</span>
+                  </div></label
+                ><label
+                  >Techo de true peak
+                  <div class="unit-input">
+                    <input
+                      v-model.number="truePeak"
+                      type="number"
+                      min="-9"
+                      max="0"
+                      step="0.1"
+                    /><span>dBTP</span>
+                  </div></label
+                >
+              </div>
+              <div v-if="tool === 'normalize'" class="method-note">
+                <Layers :size="18" />
+                <p>
+                  Medición individual por archivo · rango objetivo de 11 LU ·
+                  salida a 48 kHz. Si el objetivo exige limitar picos o reducir
+                  el rango, el motor aplica normalización dinámica.
+                </p>
+              </div>
             </template>
           </section>
 
@@ -1798,7 +2148,13 @@ onUnmounted(() => {
                     }}
                   </option>
                 </select></label
-              ><label
+              >
+              <label v-if="tool === 'split'">
+                Patrón de nombres de salida
+                <input v-model="outputNamePattern" placeholder="{archivo}_part{numero}" maxlength="100" />
+                <small>Usa <code>{numero}</code> para el índice y <code>{archivo}</code> para el nombre original.</small>
+              </label>
+              <label
                 >Destino<select v-model="destination">
                   <option value="source">Junto al archivo original</option>
                   <option value="custom">Carpeta personalizada</option>
@@ -1867,6 +2223,18 @@ onUnmounted(() => {
                       : "Exportar recorte"
                 }}<ArrowRight :size="17" />
               </button>
+              <div v-if="tool === 'split'" class="split-preset-save">
+                <div class="fields-row">
+                  <label>
+                    Nombre del preset
+                    <input v-model="presetName" maxlength="80" @keydown.enter="saveSplitPreset" />
+                  </label>
+                </div>
+                <button class="secondary-button compact" :disabled="!presetName.trim()" @click="saveSplitPreset">
+                  {{ matchingPreset ? "Actualizar preset" : "Guardar preset" }}
+                </button>
+                <p v-if="presetStatus" class="comparison-status" role="status">{{ presetStatus }}</p>
+              </div>
               <p class="export-validation" role="status">
                 {{ exportProblem || "Todo listo para exportar." }}
               </p>

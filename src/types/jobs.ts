@@ -6,7 +6,8 @@ export type QueueStatus =
   | "cancelled";
 export type MediaKind = "audio" | "video";
 export type Tool = "trim" | "split" | "normalize";
-export type SplitMode = "none" | "silence" | "chapters" | "manual";
+export type SplitMode = "none" | "silence" | "chapters" | "duration" | "manual";
+export type SplitNormalization = "none" | "before" | "after";
 export interface Segment {
   startSeconds: number;
   endSeconds: number;
@@ -22,6 +23,10 @@ export interface ProcessJobRequest {
   truePeakDbtp: number;
   eq: { bass: number; mid: number; treble: number };
   splitMode: SplitMode;
+  splitDurationSeconds?: number;
+  splitPauseWindowSeconds?: number;
+  outputNamePattern?: string;
+  splitNormalization?: SplitNormalization;
   manualMarkers: number[];
   silence: {
     thresholdDb: number;
@@ -67,4 +72,9 @@ export interface WaveformLevelsResponse {
   intervalSeconds: number;
   peaksDb: number[];
   rmsDb: number[];
+}
+
+export interface SplitComparison {
+  originalPath: string;
+  processedPath: string;
 }

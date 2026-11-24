@@ -33,7 +33,17 @@ pub enum SplitMode {
     None,
     Silence,
     Chapters,
+    Duration,
     Manual,
+}
+
+#[derive(Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum SplitNormalization {
+    #[default]
+    None,
+    Before,
+    After,
 }
 
 #[derive(Deserialize, Clone)]
@@ -75,6 +85,11 @@ pub struct ProcessMediaRequest {
     pub audio_target: Option<String>,
     #[serde(default)]
     pub split_mode: SplitMode,
+    pub split_duration_seconds: Option<f64>,
+    pub split_pause_window_seconds: Option<f64>,
+    pub output_name_pattern: Option<String>,
+    #[serde(default)]
+    pub split_normalization: SplitNormalization,
     #[serde(default)]
     pub manual_markers: Vec<f64>,
     #[serde(default)]
@@ -83,6 +98,12 @@ pub struct ProcessMediaRequest {
     pub fade_in_duration: f64,
     #[serde(default)]
     pub fade_out_duration: f64,
+}
+
+impl ProcessMediaRequest {
+    fn normalizes_each_segment(&self) -> bool {
+        self.normalize || self.split_normalization == SplitNormalization::After
+    }
 }
 
 #[derive(Serialize)]
@@ -111,11 +132,29 @@ struct InputMediaInfo {
     media_kind: String,
 }
 
-#[derive(Clone, Serialize, Debug)]
+#[derive(Clone, Deserialize, Serialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct Segment {
     start_seconds: f64,
     end_seconds: f64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SplitComparison {
+    original_path: String,
+    processed_path: String,
+}
+
+struct NormalizedAudio {
+    path: PathBuf,
+    start_seconds: f64,
+}
+
+impl Drop for NormalizedAudio {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
 }
 
 #[tauri::command]
@@ -300,6 +339,25 @@ async fn run_media_process<R: Runtime>(
         },
     );
 
+    let normalized_audio = if request.split_normalization == SplitNormalization::Before {
+        emit_loudness_progress(&app, &request, &file_name, 0.0, "Normalizando la selección");
+        let selection = Segment {
+            start_seconds: region_start,
+            end_seconds: region_end,
+        };
+        prepare_normalized_audio(
+            &ffmpeg_path,
+            &request,
+            &selection,
+            &resolved_output_dir,
+            &pid,
+            &cancelled,
+        )
+        .await?
+    } else {
+        None
+    };
+
     for (segment_index, segment) in segments.iter().enumerate() {
         if cancelled.load(Ordering::SeqCst) {
             return Err("Cancelled by user".into());
@@ -329,6 +387,7 @@ async fn run_media_process<R: Runtime>(
             segment_count,
             &staging_path,
             &file_name,
+            normalized_audio.as_ref(),
             Arc::clone(&pid),
             Arc::clone(&cancelled),
         )
@@ -450,6 +509,32 @@ async fn render_preview_audio<R: Runtime>(
     Ok(output_path.to_string_lossy().to_string())
 }
 
+fn emit_loudness_progress<R: Runtime>(
+    app: &AppHandle<R>,
+    request: &ProcessMediaRequest,
+    file_name: &str,
+    percent: f64,
+    detail: &str,
+) {
+    emit_job_progress(
+        app,
+        JobProgressPayload {
+            id: request.id.clone(),
+            job_kind: "process".into(),
+            media_kind: media_kind_for_format(&request.format).into(),
+            status: "processing".into(),
+            percent,
+            speed: "-".into(),
+            eta: "-".into(),
+            total_size: "-".into(),
+            title: Some(file_name.into()),
+            detail: Some(detail.into()),
+            output_path: None,
+            error: None,
+        },
+    );
+}
+
 async fn run_segment_render<R: Runtime>(
     app: &AppHandle<R>,
     request: &ProcessMediaRequest,
@@ -459,49 +544,41 @@ async fn run_segment_render<R: Runtime>(
     segment_count: usize,
     output_path: &Path,
     file_name: &str,
+    normalized_audio: Option<&NormalizedAudio>,
     pid: Arc<Mutex<Option<u32>>>,
     cancelled: Arc<AtomicBool>,
 ) -> Result<(), String> {
     let segment_duration = (segment.end_seconds - segment.start_seconds).max(0.0);
-    let mut filter_chain = build_filter_chain(request, segment_duration);
-    if request.normalize {
-        emit_job_progress(
+    if request.normalizes_each_segment() {
+        emit_loudness_progress(
             app,
-            JobProgressPayload {
-                id: request.id.clone(),
-                job_kind: "process".into(),
-                media_kind: media_kind_for_format(&request.format).into(),
-                status: "processing".into(),
-                percent: segment_index as f64 / segment_count as f64 * 100.0,
-                speed: "-".into(),
-                eta: "-".into(),
-                total_size: format!("{segment_count} segmento(s)"),
-                title: Some(file_name.into()),
-                detail: Some(format!(
-                    "Midiendo sonoridad · segmento {}/{} · pasada 1/2",
-                    segment_index + 1,
-                    segment_count
-                )),
-                output_path: None,
-                error: None,
-            },
-        );
-        let normalizer = analyze_loudness(
-            ffmpeg_path,
             request,
-            segment,
-            &filter_chain,
-            &pid,
-            &cancelled,
-        )
-        .await?;
-        if !filter_chain.is_empty() {
-            filter_chain.push(',');
-        }
-        filter_chain.push_str(&normalizer);
+            file_name,
+            segment_index as f64 / segment_count as f64 * 100.0,
+            &format!(
+                "Midiendo sonoridad · segmento {}/{} · pasada 1/2",
+                segment_index + 1,
+                segment_count
+            ),
+        );
     }
 
-    let args = segment_render_args(request, segment, &filter_chain, output_path);
+    let filter_chain = segment_audio_filter(
+        ffmpeg_path,
+        request,
+        segment,
+        normalized_audio.is_some(),
+        &pid,
+        &cancelled,
+    )
+    .await?;
+    let args = segment_render_args(
+        request,
+        segment,
+        &filter_chain,
+        output_path,
+        normalized_audio,
+    );
 
     if cancelled.load(Ordering::SeqCst) {
         return Err("Cancelled by user".into());
@@ -643,6 +720,16 @@ async fn build_segments(
         SplitMode::Manual => {
             build_manual_segments(region_start, region_end, &request.manual_markers)
         }
+        SplitMode::Duration => {
+            let segments =
+                build_duration_segments(region_start, region_end, request.split_duration_seconds)?;
+            let window = request.split_pause_window_seconds.unwrap_or(0.0);
+            if window == 0.0 {
+                return Ok(segments);
+            }
+            let pauses = detect_silences(ffmpeg_path, request, pid, cancelled).await?;
+            snap_duration_cuts(&segments, &pauses, window)
+        }
         SplitMode::Chapters => {
             let segments = build_chapter_segments(
                 ffmpeg_path,
@@ -673,6 +760,79 @@ async fn build_segments(
     }
 }
 
+fn snap_duration_cuts(
+    segments: &[Segment],
+    pauses: &[Segment],
+    window: f64,
+) -> Result<Vec<Segment>, String> {
+    let start = segments[0].start_seconds;
+    let end = segments.last().unwrap().end_seconds;
+    let mut boundaries = vec![start];
+    for (index, segment) in segments.iter().enumerate().skip(1) {
+        let cut = segment.start_seconds;
+        // Give adjacent cuts separate search windows so they cannot cross or collapse.
+        let low = if index == 1 {
+            start + 0.001
+        } else {
+            (segments[index - 1].start_seconds + cut) / 2.0 + 0.0005
+        };
+        let high = if index + 1 == segments.len() {
+            end - 0.001
+        } else {
+            (cut + segment.end_seconds) / 2.0 - 0.0005
+        };
+        let low = ((cut - window).max(low) * 1000.0 - 1e-8).ceil();
+        let high = ((cut + window).min(high) * 1000.0 + 1e-8).floor();
+        let closest = pauses
+            .iter()
+            .filter_map(|pause| {
+                let left = (pause.start_seconds * 1000.0).ceil().max(low);
+                let right = (pause.end_seconds * 1000.0).floor().min(high);
+                if left > right {
+                    return None;
+                }
+                let center = ((pause.start_seconds + pause.end_seconds) * 500.0).round();
+                let candidate = if pause.start_seconds <= cut && cut <= pause.end_seconds {
+                    (cut * 1000.0).round()
+                } else {
+                    center
+                };
+                Some(candidate.clamp(left, right) / 1000.0)
+            })
+            .min_by(|a, b| (a - cut).abs().total_cmp(&(b - cut).abs()));
+        boundaries.push(closest.unwrap_or(cut));
+    }
+    boundaries.push(end);
+    segments_from_boundaries(&boundaries)
+}
+
+fn build_duration_segments(
+    region_start: f64,
+    region_end: f64,
+    duration_seconds: Option<f64>,
+) -> Result<Vec<Segment>, String> {
+    let duration_ms = duration_seconds
+        .filter(|seconds| seconds.is_finite() && *seconds >= 0.001)
+        .map(|seconds| (seconds * 1000.0).round() as u64)
+        .ok_or("Introduce una duración de al menos 0.001 s por segmento.")?;
+    let start_ms = (region_start * 1000.0).round() as u64;
+    let end_ms = (region_end * 1000.0).round() as u64;
+    let count = (end_ms - start_ms).div_ceil(duration_ms);
+    if count < 2 {
+        return Err("La duración por segmento debe ser menor que la selección.".into());
+    }
+    if count > 1000 {
+        return Err(
+            "La división supera los 1000 segmentos. Aumenta la duración por segmento.".into(),
+        );
+    }
+    let boundaries: Vec<_> = (0..count)
+        .map(|index| (start_ms + index * duration_ms) as f64 / 1000.0)
+        .chain(std::iter::once(end_ms as f64 / 1000.0))
+        .collect();
+    segments_from_boundaries(&boundaries)
+}
+
 fn build_manual_segments(
     region_start: f64,
     region_end: f64,
@@ -685,7 +845,7 @@ fn build_manual_segments(
         .filter(|marker| *marker > region_start && *marker < region_end)
         .collect();
     markers.sort_by(|left, right| left.total_cmp(right));
-    markers.dedup_by(|left, right| (*left - *right).abs() < 0.001);
+    markers.dedup_by(|left, right| (*left - *right).abs() < 0.000999);
 
     if markers.is_empty() {
         return Err("Add at least one manual marker to use manual split mode.".into());
@@ -742,6 +902,29 @@ async fn build_silence_segments(
     pid: &Arc<Mutex<Option<u32>>>,
     cancelled: &Arc<AtomicBool>,
 ) -> Result<Vec<Segment>, String> {
+    let pauses = detect_silences(ffmpeg_path, request, pid, cancelled).await?;
+    let mut boundaries = vec![region_start];
+    for pause in pauses {
+        let midpoint = (pause.start_seconds + pause.end_seconds) / 2.0;
+        let last_boundary = *boundaries.last().unwrap_or(&region_start);
+        if midpoint > region_start
+            && midpoint < region_end
+            && midpoint - last_boundary >= request.silence.min_segment_duration
+            && region_end - midpoint >= request.silence.min_segment_duration
+        {
+            boundaries.push(midpoint);
+        }
+    }
+    boundaries.push(region_end);
+    segments_from_boundaries(&boundaries)
+}
+
+async fn detect_silences(
+    ffmpeg_path: &Path,
+    request: &ProcessMediaRequest,
+    pid: &Arc<Mutex<Option<u32>>>,
+    cancelled: &Arc<AtomicBool>,
+) -> Result<Vec<Segment>, String> {
     let mut command = Command::new(ffmpeg_path);
     command
         .args([
@@ -749,6 +932,9 @@ async fn build_silence_segments(
             "-nostdin",
             "-i",
             &request.input_path,
+            "-map",
+            "0:a:0",
+            "-vn",
             "-af",
             &format!(
                 "silencedetect=n={}dB:d={}",
@@ -769,7 +955,7 @@ async fn build_silence_segments(
     let re_start = Regex::new(r"silence_start:\s*([0-9]+(?:\.[0-9]+)?)").unwrap();
     let re_end = Regex::new(r"silence_end:\s*([0-9]+(?:\.[0-9]+)?)").unwrap();
 
-    let mut boundaries = vec![region_start];
+    let mut pauses = Vec::new();
     let mut active_silence_start = None::<f64>;
 
     for line in stderr.lines() {
@@ -786,34 +972,17 @@ async fn build_silence_segments(
                 .and_then(|value| value.as_str().parse::<f64>().ok());
 
             if let (Some(silence_start), Some(silence_end)) = (active_silence_start, silence_end) {
-                let midpoint = (silence_start + silence_end) / 2.0;
-                let last_boundary = *boundaries.last().unwrap_or(&region_start);
-
-                if midpoint > region_start
-                    && midpoint < region_end
-                    && midpoint - last_boundary >= request.silence.min_segment_duration
-                    && region_end - midpoint >= request.silence.min_segment_duration
-                {
-                    boundaries.push(midpoint);
-                }
+                pauses.push(Segment {
+                    start_seconds: silence_start,
+                    end_seconds: silence_end,
+                });
             }
 
             active_silence_start = None;
         }
     }
 
-    boundaries.push(region_end);
-
-    let segments = segments_from_boundaries(&boundaries)?;
-
-    if segments.is_empty() {
-        return Ok(vec![Segment {
-            start_seconds: region_start,
-            end_seconds: region_end,
-        }]);
-    }
-
-    Ok(segments)
+    Ok(pauses)
 }
 
 fn segments_from_boundaries(boundaries: &[f64]) -> Result<Vec<Segment>, String> {
@@ -914,7 +1083,10 @@ fn build_output_path(
 
     let output_format = effective_audio_format(&request.format, request.audio_target.as_deref());
 
-    let file_name = if segment_count > 1 {
+    let file_name = if let Some(pattern) = request.output_name_pattern.as_deref() {
+        let name = split_output_name(pattern, stem, segment_index)?;
+        format!("{name}.{output_format}")
+    } else if segment_count > 1 {
         format!("{}_part{:02}.{}", stem, segment_index + 1, output_format)
     } else {
         format!(
@@ -943,6 +1115,57 @@ fn build_output_path(
     Err("No se encontró un nombre de exportación disponible.".into())
 }
 
+fn split_output_name(pattern: &str, stem: &str, segment_index: usize) -> Result<String, String> {
+    let pattern = pattern.trim();
+    let invalid_char = |ch: char| ch.is_control() || "/\\:*?\"<>|".contains(ch);
+    let literals = pattern.replace("{archivo}", "").replace("{numero}", "");
+    if pattern.len() > 100
+        || !pattern.contains("{numero}")
+        || literals
+            .chars()
+            .any(|ch| invalid_char(ch) || "{}".contains(ch))
+    {
+        return Err("El nombre de salida requiere {numero} y admite {archivo}. Evita los caracteres reservados.".into());
+    }
+
+    let stem_limit = (200 - pattern.len()) / pattern.matches("{archivo}").count().max(1);
+    let mut sanitized: String = stem
+        .chars()
+        .map(|ch| {
+            if invalid_char(ch) || "{}".contains(ch) {
+                '_'
+            } else {
+                ch
+            }
+        })
+        .collect();
+    while sanitized.len() > stem_limit {
+        sanitized.pop();
+    }
+    let name = pattern
+        .replace("{archivo}", &sanitized)
+        .replace("{numero}", &format!("{:02}", segment_index + 1));
+    let head = name
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .trim_end()
+        .to_ascii_uppercase();
+    if matches!(head.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || ["COM", "LPT"].iter().any(|prefix| {
+            head.strip_prefix(prefix).is_some_and(|number| {
+                matches!(
+                    number,
+                    "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+                )
+            })
+        })
+    {
+        return Ok(format!("_{name}"));
+    }
+    Ok(name)
+}
+
 fn resolve_output_dir(request: &ProcessMediaRequest, input_path: &str) -> Result<PathBuf, String> {
     let input = Path::new(input_path);
 
@@ -963,7 +1186,7 @@ fn effective_audio_format<'a>(format: &'a str, audio_target: Option<&str>) -> &'
     }
 }
 
-fn build_filter_chain(request: &ProcessMediaRequest, segment_duration: f64) -> String {
+fn equalizer_filters(request: &ProcessMediaRequest) -> Vec<String> {
     let mut filters = Vec::new();
 
     if request.eq.bass.abs() > 0.01 {
@@ -980,35 +1203,40 @@ fn build_filter_chain(request: &ProcessMediaRequest, segment_duration: f64) -> S
             request.eq.treble
         ));
     }
+    filters
+}
 
+fn fade_filters(request: &ProcessMediaRequest, segment_duration: f64) -> Vec<String> {
+    let mut filters = Vec::new();
     let max_fade = (segment_duration / 2.0).max(0.0);
     let fade_in = request.fade_in_duration.max(0.0).min(max_fade);
     let fade_out = request.fade_out_duration.max(0.0).min(max_fade);
 
-    if fade_in > 0.0 {
+    if fade_in >= 0.000_5 {
+        filters.push(format!("afade=t=in:st=0:d={fade_in:.6}"));
+    }
+
+    if fade_out >= 0.000_5 {
         filters.push(format!(
-            "afade=t=in:st=0:d={}",
-            format_ffmpeg_seconds(fade_in)
+            "afade=t=out:st={:.6}:d={fade_out:.6}",
+            segment_duration - fade_out,
         ));
     }
 
-    if fade_out > 0.0 {
-        filters.push(format!(
-            "afade=t=out:st={}:d={}",
-            format_ffmpeg_seconds((segment_duration - fade_out).max(0.0)),
-            format_ffmpeg_seconds(fade_out)
-        ));
-    }
-
-    filters.join(",")
+    filters
 }
 
-fn apply_output_format_args(args: &mut Vec<String>, format: &str, audio_target: Option<&str>) {
+fn apply_output_format_args(
+    args: &mut Vec<String>,
+    format: &str,
+    audio_target: Option<&str>,
+    audio_map: &str,
+) {
     if is_audio_format(format) {
         args.extend(
             [
                 "-map",
-                "0:a:0",
+                audio_map,
                 "-vn",
                 "-map_metadata",
                 "0",
@@ -1080,11 +1308,26 @@ fn apply_output_format_args(args: &mut Vec<String>, format: &str, audio_target: 
         return;
     }
 
+    let video_audio_map = if audio_map == "0:a:0" {
+        "0:a:0?"
+    } else {
+        audio_map
+    };
     args.extend(
-        ["-map", "0:v:0?", "-map", "0:a:0?", "-map_chapters", "-1"]
-            .iter()
-            .map(ToString::to_string),
+        [
+            "-map",
+            "0:v:0?",
+            "-map",
+            video_audio_map,
+            "-map_chapters",
+            "-1",
+        ]
+        .iter()
+        .map(ToString::to_string),
     );
+    if audio_map != "0:a:0" {
+        args.extend(["-map_metadata".into(), "0".into()]);
+    }
 
     match format {
         "webm" => {
@@ -1243,6 +1486,20 @@ fn validate_request(request: &ProcessMediaRequest) -> Result<(), String> {
     ) {
         return Err("Formato de salida no compatible.".into());
     }
+    if request.split_normalization != SplitNormalization::None
+        && (request.normalize || request.split_mode == SplitMode::None)
+    {
+        return Err("La normalización encadenada requiere un método de división.".into());
+    }
+    if request
+        .split_pause_window_seconds
+        .is_some_and(|window| !(0.0..=60.0).contains(&window))
+    {
+        return Err("La ventana de búsqueda de pausas debe estar entre 0 y 60 s.".into());
+    }
+    if let Some(pattern) = &request.output_name_pattern {
+        split_output_name(pattern, "archivo", 0)?;
+    }
     if !request.loudness_target_lufs.is_finite()
         || !(-30.0..=-6.0).contains(&request.loudness_target_lufs)
         || !request.true_peak_dbtp.is_finite()
@@ -1291,6 +1548,139 @@ pub async fn preview_segments<R: Runtime>(
     .await;
     state.remove(&request.id);
     result
+}
+
+fn split_comparison_dir<R: Runtime>(app: &AppHandle<R>, id: &str) -> Result<PathBuf, String> {
+    if id.len() != 36
+        || !id
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() || byte == b'-')
+    {
+        return Err("Identificador de preescucha inválido.".into());
+    }
+    Ok(app
+        .path()
+        .app_cache_dir()
+        .map_err(|err| err.to_string())?
+        .join("waveforms")
+        .join("split-comparisons")
+        .join(id))
+}
+
+#[tauri::command]
+pub async fn render_split_comparison<R: Runtime>(
+    app: AppHandle<R>,
+    state: State<'_, JobState>,
+    request: ProcessMediaRequest,
+    segment: Segment,
+) -> Result<SplitComparison, String> {
+    validate_request(&request)?;
+    let directory = split_comparison_dir(&app, &request.id)?;
+    let (pid, cancelled) = state.register(&request.id)?;
+    let result = async {
+        let ffmpeg = resolve_ffmpeg_path(&app)?;
+        let info = probe_media_info(&ffmpeg, &request.input_path).await?;
+        let (start_seconds, end_seconds) = resolve_processing_window(
+            info.duration_seconds,
+            &request.trim_start,
+            &request.trim_end,
+        )?;
+        if !segment.start_seconds.is_finite()
+            || !segment.end_seconds.is_finite()
+            || segment.start_seconds < start_seconds - 0.0005
+            || segment.end_seconds > end_seconds + 0.0005
+            || segment.end_seconds - segment.start_seconds < 0.000999
+        {
+            return Err("El segmento de preescucha debe estar dentro de la selección.".into());
+        }
+        let selection = Segment {
+            start_seconds,
+            end_seconds,
+        };
+        let parent = directory.parent().unwrap();
+        fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+        fs::create_dir(&directory).map_err(|err| err.to_string())?;
+        let result = render_comparison_files(
+            &ffmpeg,
+            request.clone(),
+            &selection,
+            &segment,
+            &directory,
+            &pid,
+            &cancelled,
+        )
+        .await;
+        if result.is_err() {
+            let _ = fs::remove_dir_all(&directory);
+        }
+        result
+    }
+    .await;
+    state.remove(&request.id);
+    result
+}
+
+#[tauri::command]
+pub fn remove_split_comparison<R: Runtime>(app: AppHandle<R>, id: String) -> Result<(), String> {
+    match fs::remove_dir_all(split_comparison_dir(&app, &id)?) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err.to_string()),
+    }
+}
+
+async fn render_comparison_files(
+    ffmpeg: &Path,
+    mut request: ProcessMediaRequest,
+    selection: &Segment,
+    segment: &Segment,
+    directory: &Path,
+    pid: &Arc<Mutex<Option<u32>>>,
+    cancelled: &Arc<AtomicBool>,
+) -> Result<SplitComparison, String> {
+    request.format = "wav".into();
+    request.audio_target = None;
+    let original_path = directory.join("A.wav");
+    let processed_path = directory.join("B.wav");
+    let normalized_audio = if request.split_normalization == SplitNormalization::Before {
+        prepare_normalized_audio(ffmpeg, &request, selection, directory, pid, cancelled).await?
+    } else {
+        None
+    };
+    let filter = segment_audio_filter(
+        ffmpeg,
+        &request,
+        segment,
+        normalized_audio.is_some(),
+        pid,
+        cancelled,
+    )
+    .await?;
+    let processed = segment_render_args(
+        &request,
+        segment,
+        &filter,
+        &processed_path,
+        normalized_audio.as_ref(),
+    );
+    request.normalize = false;
+    request.split_normalization = SplitNormalization::None;
+    let original = segment_render_args(&request, segment, "", &original_path, None);
+    for args in [original, processed] {
+        let mut command = Command::new(ffmpeg);
+        command
+            .args(args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        let output = tracked_output(&mut command, pid, cancelled).await?;
+        if !output.status.success() {
+            return Err(String::from_utf8_lossy(&output.stderr).into_owned());
+        }
+    }
+    Ok(SplitComparison {
+        original_path: original_path.to_string_lossy().into_owned(),
+        processed_path: processed_path.to_string_lossy().into_owned(),
+    })
 }
 
 fn reserve_staging_path(output: &Path) -> Result<PathBuf, String> {
@@ -1346,11 +1736,18 @@ fn loudness_filter(request: &ProcessMediaRequest) -> String {
     )
 }
 
-fn measured_loudness_filter(json: &str, target: &str) -> Result<String, String> {
+fn measured_loudness_filter(
+    json: &str,
+    target: &str,
+    allow_unmeasurable: bool,
+) -> Result<Option<String>, String> {
     let start = json.rfind('{').ok_or("No se pudo medir la sonoridad.")?;
     let end = json[start..].find('}').ok_or("Medición incompleta.")? + start;
     let values: serde_json::Value =
         serde_json::from_str(&json[start..=end]).map_err(|e| e.to_string())?;
+    if allow_unmeasurable && values["input_i"].as_str() == Some("-inf") {
+        return Ok(None);
+    }
     let mut result = target.to_string();
     for (key, parameter) in [
         ("input_i", "measured_I"),
@@ -1367,7 +1764,19 @@ fn measured_loudness_filter(json: &str, target: &str) -> Result<String, String> 
         result.push_str(&format!(":{parameter}={number}"));
     }
     result.push_str(":linear=true");
-    Ok(result)
+    Ok(Some(result))
+}
+
+fn bounded_audio_filter(segment: &Segment, preprocessing: &str, normalizer: &str) -> String {
+    let trim = format!(
+        "atrim=end={}",
+        format_ffmpeg_seconds(segment.end_seconds - segment.start_seconds)
+    );
+    [trim.as_str(), preprocessing, normalizer]
+        .into_iter()
+        .filter(|filter| !filter.is_empty())
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 async fn analyze_loudness(
@@ -1377,13 +1786,13 @@ async fn analyze_loudness(
     preprocessing: &str,
     pid: &Arc<Mutex<Option<u32>>>,
     cancelled: &Arc<AtomicBool>,
-) -> Result<String, String> {
+) -> Result<Option<String>, String> {
     let target = loudness_filter(request);
-    let filter = if preprocessing.is_empty() {
-        format!("{target}:print_format=json")
-    } else {
-        format!("{preprocessing},{target}:print_format=json")
-    };
+    let filter = bounded_audio_filter(
+        segment,
+        preprocessing,
+        &format!("{target}:print_format=json"),
+    );
     let mut command = Command::new(ffmpeg);
     command
         .args([
@@ -1393,8 +1802,6 @@ async fn analyze_loudness(
             &format_ffmpeg_seconds(segment.start_seconds),
             "-i",
             &request.input_path,
-            "-t",
-            &format_ffmpeg_seconds(segment.end_seconds - segment.start_seconds),
             "-map",
             "0:a:0",
             "-vn",
@@ -1410,7 +1817,96 @@ async fn analyze_loudness(
     if !output.status.success() {
         return Err(String::from_utf8_lossy(&output.stderr).into_owned());
     }
-    measured_loudness_filter(&String::from_utf8_lossy(&output.stderr), &target)
+    measured_loudness_filter(
+        &String::from_utf8_lossy(&output.stderr),
+        &target,
+        request.split_normalization != SplitNormalization::None,
+    )
+}
+
+async fn prepare_normalized_audio(
+    ffmpeg: &Path,
+    request: &ProcessMediaRequest,
+    selection: &Segment,
+    output_dir: &Path,
+    pid: &Arc<Mutex<Option<u32>>>,
+    cancelled: &Arc<AtomicBool>,
+) -> Result<Option<NormalizedAudio>, String> {
+    // Keep any initial audio offset so the new track stays aligned with the source video.
+    let preprocessing = std::iter::once("aresample=48000:async=1:first_pts=0".into())
+        .chain(equalizer_filters(request))
+        .collect::<Vec<_>>()
+        .join(",");
+    let Some(normalizer) =
+        analyze_loudness(ffmpeg, request, selection, &preprocessing, pid, cancelled).await?
+    else {
+        return Ok(None);
+    };
+    let audio = NormalizedAudio {
+        path: reserve_staging_path(&output_dir.join("normalized-audio.wav"))?,
+        start_seconds: selection.start_seconds,
+    };
+    let filter = bounded_audio_filter(selection, &preprocessing, &normalizer);
+    let mut command = Command::new(ffmpeg);
+    command
+        .args([
+            "-hide_banner",
+            "-nostdin",
+            "-loglevel",
+            "error",
+            "-y",
+            "-ss",
+            &format_ffmpeg_seconds(selection.start_seconds),
+            "-i",
+            &request.input_path,
+            "-map",
+            "0:a:0",
+            "-vn",
+            "-af",
+            &filter,
+            "-ar",
+            "48000",
+            "-c:a",
+            "pcm_f32le",
+            "-rf64",
+            "auto",
+        ])
+        .arg(&audio.path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let output = tracked_output(&mut command, pid, cancelled).await?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).into_owned());
+    }
+    Ok(Some(audio))
+}
+
+async fn segment_audio_filter(
+    ffmpeg: &Path,
+    request: &ProcessMediaRequest,
+    segment: &Segment,
+    has_normalized_audio: bool,
+    pid: &Arc<Mutex<Option<u32>>>,
+    cancelled: &Arc<AtomicBool>,
+) -> Result<String, String> {
+    let mut filters = if has_normalized_audio {
+        Vec::new()
+    } else {
+        equalizer_filters(request)
+    };
+    filters.extend(fade_filters(
+        request,
+        segment.end_seconds - segment.start_seconds,
+    ));
+    let preprocessing = filters.join(",");
+    if request.normalizes_each_segment() {
+        if let Some(normalizer) =
+            analyze_loudness(ffmpeg, request, segment, &preprocessing, pid, cancelled).await?
+        {
+            return Ok(bounded_audio_filter(segment, &preprocessing, &normalizer));
+        }
+    }
+    Ok(preprocessing)
 }
 
 fn segment_render_args(
@@ -1418,6 +1914,7 @@ fn segment_render_args(
     segment: &Segment,
     filter_chain: &str,
     output_path: &Path,
+    normalized_audio: Option<&NormalizedAudio>,
 ) -> Vec<String> {
     let segment_duration = segment.end_seconds - segment.start_seconds;
     let mut args = vec![
@@ -1433,6 +1930,17 @@ fn segment_render_args(
 
     args.push("-i".to_string());
     args.push(request.input_path.clone());
+    let audio_map = if let Some(audio) = normalized_audio {
+        args.extend([
+            "-ss".into(),
+            format_ffmpeg_seconds(segment.start_seconds - audio.start_seconds),
+            "-i".into(),
+            audio.path.to_string_lossy().into_owned(),
+        ]);
+        "1:a:0"
+    } else {
+        "0:a:0"
+    };
     args.push("-t".to_string());
     args.push(format_ffmpeg_seconds(segment_duration));
 
@@ -1441,8 +1949,15 @@ fn segment_render_args(
         args.push(filter_chain.to_string());
     }
 
-    apply_output_format_args(&mut args, &request.format, request.audio_target.as_deref());
-    if request.normalize && !is_azuracast_target(request.audio_target.as_deref()) {
+    apply_output_format_args(
+        &mut args,
+        &request.format,
+        request.audio_target.as_deref(),
+        audio_map,
+    );
+    if (request.normalize || request.split_normalization != SplitNormalization::None)
+        && !is_azuracast_target(request.audio_target.as_deref())
+    {
         args.extend(["-ar".into(), "48000".into()]);
     }
 
@@ -1506,6 +2021,60 @@ mod tests {
         );
         output
     }
+    async fn read_samples(path: &Path) -> Vec<f32> {
+        ffmpeg(&["-i", path.to_str().unwrap(), "-f", "f32le", "-"])
+            .await
+            .stdout
+            .chunks_exact(4)
+            .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect()
+    }
+
+    fn sample_peak(samples: &[f32]) -> f32 {
+        samples.iter().map(|value| value.abs()).fold(0.0, f32::max)
+    }
+    #[tokio::test]
+    async fn duration_split_starts_at_the_selection_and_keeps_the_remainder() {
+        let preset = |seconds| {
+            serde_json::from_value::<ProcessMediaRequest>(serde_json::json!({
+                "id": "test", "inputPath": "unused.wav", "format": "wav", "normalize": false,
+                "eq": { "bass": 0, "mid": 0, "treble": 0 },
+                "splitMode": "duration", "splitDurationSeconds": seconds
+            }))
+            .expect("fixed-duration split settings should deserialize")
+        };
+        let (pid, cancelled) = control();
+        let request = preset(3.125);
+        let segments = build_segments(Path::new("ffmpeg"), &request, 2.0, 9.4, &pid, &cancelled)
+            .await
+            .unwrap();
+        let intervals: Vec<_> = segments
+            .iter()
+            .map(|segment| (segment.start_seconds, segment.end_seconds))
+            .collect();
+        assert_eq!(intervals, [(2.0, 5.125), (5.125, 8.25), (8.25, 9.4)]);
+
+        for seconds in [0.0, 0.007, 7.4, 10.0] {
+            assert!(
+                build_segments(
+                    Path::new("ffmpeg"),
+                    &preset(seconds),
+                    2.0,
+                    9.4,
+                    &pid,
+                    &cancelled
+                )
+                .await
+                .is_err(),
+                "Invalid duration or segment count for {seconds} seconds"
+            );
+        }
+        let exact = build_segments(Path::new("ffmpeg"), &request, 2.0, 8.25, &pid, &cancelled)
+            .await
+            .unwrap();
+        assert_eq!(exact.len(), 2);
+        assert_eq!(exact[1].end_seconds, 8.25);
+    }
     #[test]
     fn validates_time_inputs_without_silent_fallbacks() {
         assert_eq!(parse_user_time("01:02:03.125"), Some(3723.125));
@@ -1535,6 +2104,85 @@ mod tests {
             2
         );
     }
+
+    #[test]
+    fn split_normalization_order_can_be_saved_with_legacy_requests() {
+        let fixture = Fixture::new();
+        let input = fixture.0.join("input.wav");
+        let legacy = serde_json::json!({
+            "id": "test", "inputPath": input, "format": "wav", "normalize": false,
+            "eq": { "bass": 0, "mid": 0, "treble": 0 }, "splitMode": "manual"
+        });
+        for (order, should_resample) in [("none", false), ("before", true), ("after", true)] {
+            let mut settings = legacy.clone();
+            if order != "none" {
+                settings["splitNormalization"] = serde_json::json!(order);
+            }
+            let request = serde_json::from_value(settings).unwrap();
+            let segment = Segment {
+                start_seconds: 0.0,
+                end_seconds: 4.0,
+            };
+            let args =
+                segment_render_args(&request, &segment, "", &fixture.0.join("out.wav"), None);
+            assert_eq!(
+                args.windows(2).any(|args| args == ["-ar", "48000"]),
+                should_resample,
+                "{order}"
+            );
+        }
+    }
+    #[test]
+    fn split_exports_expand_the_source_name_and_index_without_overwriting() {
+        let fixture = Fixture::new();
+        let source = fixture.0.join("Mi concierto.wav");
+        fs::write(&source, "source").unwrap();
+        let request: ProcessMediaRequest = serde_json::from_value(serde_json::json!({
+            "id": "test", "inputPath": source, "format": "wav", "normalize": false,
+            "eq": { "bass": 0, "mid": 0, "treble": 0 }, "splitMode": "manual",
+            "outputNamePattern": "Pista-{numero} - {archivo}"
+        }))
+        .unwrap();
+        let first = build_output_path(&request, &request.input_path, 0, 2).unwrap();
+        assert_eq!(first, fixture.0.join("Pista-01 - Mi concierto.wav"));
+        fs::write(&first, "previous").unwrap();
+        let second = build_output_path(&request, &request.input_path, 0, 2).unwrap();
+        assert_eq!(second, fixture.0.join("Pista-01 - Mi concierto_2.wav"));
+        assert!(split_output_name("../{numero}", "source", 0).is_err());
+        assert!(split_output_name("{archivo}", "source", 0).is_err());
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires FFmpeg on PATH"]
+    async fn duration_split_finds_a_nearby_pause_and_keeps_unmatched_cuts() {
+        let fixture = Fixture::new();
+        let input = fixture.0.join("pauses.wav");
+        ffmpeg(&[
+            "-f",
+            "lavfi",
+            "-i",
+            r"aevalsrc=sin(2*PI*997*t)*if(between(t\,3.4\,4.2)\,0\,0.2):s=48000:d=11",
+            input.to_str().unwrap(),
+        ])
+        .await;
+        let request: ProcessMediaRequest = serde_json::from_value(serde_json::json!({
+            "id": "test", "inputPath": input, "format": "wav", "normalize": false,
+            "eq": { "bass": 0, "mid": 0, "treble": 0 }, "splitMode": "duration",
+            "splitDurationSeconds": 3, "splitPauseWindowSeconds": 1,
+            "silence": { "minSilenceDuration": 0.3 }
+        }))
+        .unwrap();
+        let (pid, cancelled) = control();
+        let parts = build_segments(Path::new("ffmpeg"), &request, 0.0, 11.0, &pid, &cancelled)
+            .await
+            .unwrap();
+        assert_eq!(parts.len(), 4);
+        assert!((parts[0].end_seconds - 3.8).abs() < 0.01);
+        assert_eq!(parts[1].start_seconds, parts[0].end_seconds);
+        assert_eq!(parts[1].end_seconds, 6.0);
+        assert_eq!(parts[3].end_seconds, 11.0);
+    }
+
     #[test]
     fn exports_never_reuse_existing_names_and_staging_is_unique() {
         let fixture = Fixture::new();
@@ -1583,7 +2231,13 @@ mod tests {
     #[test]
     fn silent_measurements_are_not_treated_as_valid_loudness() {
         let measurement = r#"{"input_i":"-inf","input_tp":"-inf","input_lra":"0","input_thresh":"-70","target_offset":"inf"}"#;
-        assert!(measured_loudness_filter(measurement, "loudnorm=I=-16:TP=-1.5:LRA=11").is_err());
+        assert!(
+            measured_loudness_filter(measurement, "loudnorm=I=-16:TP=-1.5:LRA=11", false).is_err()
+        );
+        assert_eq!(
+            measured_loudness_filter(measurement, "loudnorm=I=-16:TP=-1.5:LRA=11", true).unwrap(),
+            None
+        );
     }
     #[tokio::test]
     #[ignore = "Requires FFmpeg on PATH"]
@@ -1636,7 +2290,7 @@ mod tests {
             end_seconds: 1.734,
         };
         let output = fixture.0.join("trim.wav");
-        let args = segment_render_args(&request, &segment, "", &output);
+        let args = segment_render_args(&request, &segment, "", &output, None);
         let result = Command::new("ffmpeg").args(args).output().await.unwrap();
         assert!(
             result.status.success(),
@@ -1647,6 +2301,34 @@ mod tests {
             .await
             .unwrap();
         assert!((info.duration_seconds - 1.321).abs() < 0.011);
+
+        let engine = Path::new("ffmpeg");
+        request.fade_in_duration = 0.25;
+        request.fade_out_duration = 0.25;
+        request.manual_markers = vec![1.0];
+        for (mode, check_first) in [(SplitMode::Silence, false), (SplitMode::Manual, true)] {
+            request.split_mode = mode;
+            let parts = build_segments(engine, &request, 0.0, 5.0, &pid, &cancelled)
+                .await
+                .unwrap();
+            let part = if check_first { &parts[0] } else { &parts[1] };
+            let filter = segment_audio_filter(engine, &request, part, false, &pid, &cancelled)
+                .await
+                .unwrap();
+            let args = segment_render_args(&request, part, &filter, &output, None);
+            let result = Command::new(engine).args(args).output().await.unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            let samples = read_samples(&output).await;
+            if check_first {
+                assert!(sample_peak(&samples[..441]) < 0.006);
+            }
+            assert!(sample_peak(&samples[samples.len() - 441..]) < 0.006);
+            assert!(sample_peak(&samples) > 0.12);
+        }
     }
     #[tokio::test]
     #[ignore = "Requires FFmpeg on PATH"]
@@ -1725,9 +2407,10 @@ mod tests {
             &cancelled,
         )
         .await
+        .unwrap()
         .unwrap();
         assert!(filter.contains("measured_I="));
-        let args = segment_render_args(&request, &segment, &filter, &output);
+        let args = segment_render_args(&request, &segment, &filter, &output, None);
         let render = Command::new("ffmpeg").args(args).output().await.unwrap();
         assert!(
             render.status.success(),
@@ -1752,6 +2435,183 @@ mod tests {
         let peak: f64 = values["input_tp"].as_str().unwrap().parse().unwrap();
         assert!((lufs + 16.0).abs() < 0.2, "LUFS: {lufs}");
         assert!(peak <= -1.4, "True peak: {peak}");
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires FFmpeg on PATH"]
+    async fn ffmpeg_fades_and_normalizes_fixed_split_in_either_order() {
+        let fixture = Fixture::new();
+        let input = fixture.0.join("uneven.wav");
+        let source =
+            r"aevalsrc=sin(2*PI*997*t)*if(lt(t\,1)\,0.9\,if(lt(t\,5)\,0.05\,0.15)):s=48000:d=9";
+        ffmpeg(&["-f", "lavfi", "-i", source, input.to_str().unwrap()]).await;
+
+        let mut request = request(&input);
+        request.split_mode = SplitMode::Duration;
+        request.split_duration_seconds = Some(4.0);
+        request.fade_in_duration = 0.25;
+        request.fade_out_duration = 0.5;
+        let engine = Path::new("ffmpeg");
+        let (pid, cancelled) = control();
+        let selection = Segment {
+            start_seconds: 1.0,
+            end_seconds: 9.0,
+        };
+        let segments = build_segments(engine, &request, 1.0, 9.0, &pid, &cancelled)
+            .await
+            .unwrap();
+        assert_eq!(segments.len(), 2);
+
+        for (order, should_level_parts) in [
+            (SplitNormalization::Before, false),
+            (SplitNormalization::After, true),
+            (SplitNormalization::None, false),
+        ] {
+            request.split_normalization = order;
+            let normalized = if order == SplitNormalization::Before {
+                let audio = prepare_normalized_audio(
+                    engine, &request, &selection, &fixture.0, &pid, &cancelled,
+                )
+                .await
+                .unwrap()
+                .expect("selection should have measurable loudness");
+                Some(audio)
+            } else {
+                None
+            };
+            let mut peaks = Vec::new();
+            for (index, segment) in segments.iter().enumerate() {
+                let filter = segment_audio_filter(
+                    engine,
+                    &request,
+                    segment,
+                    normalized.is_some(),
+                    &pid,
+                    &cancelled,
+                )
+                .await
+                .unwrap();
+                let output = fixture.0.join(format!("part-{index}.wav"));
+                let args =
+                    segment_render_args(&request, segment, &filter, &output, normalized.as_ref());
+                let rendered = Command::new(engine).args(args).output().await.unwrap();
+                assert!(
+                    rendered.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&rendered.stderr)
+                );
+
+                let samples = read_samples(&output).await;
+                assert_eq!(samples.len(), 4 * 48_000);
+                let middle = sample_peak(&samples[48_000..96_000]);
+                assert!(sample_peak(&samples[..480]) < middle * 0.06, "fade in");
+                assert!(
+                    sample_peak(&samples[samples.len() - 480..]) < middle * 0.04,
+                    "fade out"
+                );
+                peaks.push(middle);
+                if order == SplitNormalization::Before {
+                    let source_peak = [0.05, 0.15][index];
+                    assert!(middle > source_peak * 1.1, "Global gain was not applied");
+                }
+                if should_level_parts {
+                    let measured = ffmpeg(&[
+                        "-i",
+                        output.to_str().unwrap(),
+                        "-af",
+                        "loudnorm=print_format=json",
+                        "-f",
+                        "null",
+                        "-",
+                    ])
+                    .await;
+                    let raw = String::from_utf8_lossy(&measured.stderr);
+                    let values: serde_json::Value = serde_json::from_str(
+                        &raw[raw.rfind('{').unwrap()..=raw.rfind('}').unwrap()],
+                    )
+                    .unwrap();
+                    let lufs = values["input_i"].as_str().unwrap().parse::<f64>().unwrap();
+                    assert!((lufs + 16.0).abs() < 0.4, "Part {index}: {lufs} LUFS");
+                }
+            }
+            let ratio = peaks[1] / peaks[0];
+            if should_level_parts {
+                assert!((0.95..1.05).contains(&ratio), "Peak ratio: {ratio}");
+            } else {
+                assert!((2.9..3.1).contains(&ratio), "Peak ratio: {ratio}");
+            }
+            if let Some(audio) = normalized {
+                let path = audio.path.clone();
+                drop(audio);
+                assert!(!path.exists(), "Temporary audio should be removed");
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires FFmpeg on PATH"]
+    async fn split_comparison_uses_the_same_segment_with_dry_and_processed_audio() {
+        let fixture = Fixture::new();
+        let source = fixture.0.join("source.wav");
+        ffmpeg(&[
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=997:duration=6:sample_rate=48000",
+            "-af",
+            "volume=0.25",
+            source.to_str().unwrap(),
+        ])
+        .await;
+        let mut request = request(&source);
+        request.split_mode = SplitMode::Manual;
+        request.split_normalization = SplitNormalization::After;
+        request.fade_in_duration = 0.3;
+        request.fade_out_duration = 0.4;
+        let window = Segment {
+            start_seconds: 0.5,
+            end_seconds: 5.0,
+        };
+        let segment = Segment {
+            start_seconds: 1.25,
+            end_seconds: 4.25,
+        };
+        let (pid, cancelled) = control();
+        let comparison = render_comparison_files(
+            Path::new("ffmpeg"),
+            request.clone(),
+            &window,
+            &segment,
+            &fixture.0,
+            &pid,
+            &cancelled,
+        )
+        .await
+        .unwrap();
+        let original = read_samples(Path::new(&comparison.original_path)).await;
+        let processed = read_samples(Path::new(&comparison.processed_path)).await;
+        assert_eq!(original.len(), 3 * 48_000);
+        assert_eq!(processed.len(), original.len());
+        assert!(sample_peak(&original[..480]) > 0.03);
+        assert!(sample_peak(&processed[..480]) < 0.012);
+        assert!(sample_peak(&processed[48_000..96_000]) > 0.15);
+        assert!(sample_peak(&processed[processed.len() - 480..]) < 0.012);
+
+        let filter = segment_audio_filter(
+            Path::new("ffmpeg"),
+            &request,
+            &segment,
+            false,
+            &pid,
+            &cancelled,
+        )
+        .await
+        .unwrap();
+        let exported = fixture.0.join("exported.wav");
+        let args = segment_render_args(&request, &segment, &filter, &exported, None);
+        let result = Command::new("ffmpeg").args(args).output().await.unwrap();
+        assert!(result.status.success());
+        assert_eq!(processed, read_samples(&exported).await);
     }
     #[cfg(unix)]
     #[tokio::test]

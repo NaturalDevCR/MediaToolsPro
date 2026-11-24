@@ -49,7 +49,7 @@ La instalación del motor necesita internet. Una vez disponible FFmpeg, puedes p
 | Herramienta   | Controles principales                                                                             | Resultado                                             |
 | ------------- | ------------------------------------------------------------------------------------------------- | ----------------------------------------------------- |
 | **Trim**      | Selección sobre la onda, inicio/final con milisegundos, preescucha en bucle y fades.              | Un archivo con el fragmento seleccionado.             |
-| **Split**     | Capítulos incrustados, detección de silencios o cortes manuales; revisión y escucha de segmentos. | Un archivo independiente por segmento.                |
+| **Split**     | Capítulos, silencios, duración fija o cortes manuales, con fades y normalización opcionales.       | Un archivo independiente por segmento.                |
 | **Normalize** | Objetivo LUFS, techo de true peak y presets Podcast, Streaming y Broadcast.                       | Archivos con sonoridad ajustada mediante dos pasadas. |
 
 ### Forma de onda e inspección de silencios
@@ -79,13 +79,20 @@ Los originales se conservan. Las exportaciones usan nombres disponibles y no sob
 
 ### Dividir con Split
 
-Selecciona uno de los tres métodos:
+Selecciona un método de división.
 
 - **Por capítulos:** pulsa **Leer capítulos**. El archivo debe contener capítulos incrustados. Si faltan, la aplicación lo indica; puedes elegir silencios o cortes manuales.
 - **Por silencios:** mide una pausa en la onda, ajusta **umbral**, **pausa mínima** y **segmento mínimo**, y pulsa **Detectar silencios**. Los cortes se colocan en el centro de las pausas válidas.
+- **Por duración:** introduce un intervalo en segundos o en `mm:ss.mmm` y pulsa **Generar segmentos**. Los cortes se cuentan desde el inicio de la selección y se conserva el tramo final más corto. Activa **Buscar una pausa cerca de cada corte** y configura la ventana, la pausa mínima y el umbral. Si falta una pausa en la ventana, se usa el tiempo original del corte.
 - **Manual:** haz doble clic en la onda, añade un corte en el cursor o introduce un tiempo exacto. Puedes retirar marcas de la lista.
 
-Revisa y escucha los segmentos. Si usaste autosplit, **Ajustar manualmente** permite conservar los cortes detectados y editarlos. Después pulsa **Exportar segmentos**. Los cortes que quedan fuera de la selección no se exportan.
+Revisa y escucha los segmentos. **Ajustar manualmente** copia los cortes generados para que puedas editarlos. En cualquiera de los cuatro métodos, ajusta los fades de entrada y salida en segundos. Usa **0** para desactivar un fade. Cada fade dura como máximo la mitad de su segmento.
+
+Puedes aplicar **Normalización de sonoridad** antes de dividir para medir y ajustar toda la selección en conjunto, o después de dividir para medir y ajustar cada segmento con sus fades. Elige un preset o ajusta los objetivos de LUFS y true peak. Pulsa **Exportar segmentos** para aplicar toda la configuración.
+
+Usa **A/B** junto al segmento para alternar entre el audio original y el procesado en la misma posición. La preescucha usa audio WAV con los fades y la normalización que hayas configurado.
+
+En **Exportación** puedes usar un patrón como `Pista-{numero} - {archivo}`. La aplicación añade la extensión y mantiene nombres disponibles si hay una coincidencia. Guarda el flujo con **Guardar preset** y recupéralo desde **Preset de Split** cuando abras otro archivo. Las marcas manuales se definen para cada archivo.
 
 ### Ajustar sonoridad con Normalize
 

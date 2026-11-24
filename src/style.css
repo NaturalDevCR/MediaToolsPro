@@ -924,7 +924,35 @@ kbd {
   line-height: 1.8;
   margin: 14px 0;
 }
-.silence-fields {
+.normalization-help {
+  margin-bottom: 0;
+}
+.split-preset-picker {
+  align-items: end;
+  margin-bottom: 16px;
+}
+.split-snap-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 12px;
+  color: var(--muted);
+  font-size: 11px;
+}
+.split-snap-toggle input {
+  width: auto;
+  accent-color: var(--accent);
+}
+.split-preset-save {
+  border-top: 1px solid var(--border);
+  padding-top: 14px;
+  display: grid;
+  gap: 10px;
+}
+.split-preset-save button {
+  justify-self: start;
+}
+.split-parameters {
   gap: 10px;
   margin-bottom: 16px;
 }
@@ -1022,6 +1050,48 @@ kbd {
 .segment-row small {
   font-size: 9px;
   color: var(--muted);
+}
+.comparison-button {
+  background: var(--panel-soft);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 5px 7px;
+  color: var(--muted);
+}
+.comparison-button[aria-pressed="true"] {
+  color: var(--accent);
+}
+.segment-comparison {
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  margin: 0 20px 16px;
+  padding: 12px;
+}
+.comparison-title,
+.comparison-actions,
+.comparison-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.comparison-title {
+  justify-content: space-between;
+}
+.comparison-actions .split-mode-tabs {
+  flex: 1;
+}
+.comparison-status {
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.5;
+}
+.comparison-status.error-text {
+  color: var(--danger);
+}
+.comparison-player input[type="range"] {
+  margin-top: 8px;
+  padding: 0;
+  accent-color: var(--accent);
 }
 .muted {
   color: var(--muted);

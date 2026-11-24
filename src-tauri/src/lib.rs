@@ -60,6 +60,8 @@ pub fn run() {
             media::probe_media,
             media::analyze_waveform,
             media::preview_segments,
+            media::render_split_comparison,
+            media::remove_split_comparison,
             media::render_waveform_preview,
             media::start_media_process
         ])
