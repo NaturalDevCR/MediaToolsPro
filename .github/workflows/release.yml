@@ -147,6 +147,26 @@ jobs:
           uploadUpdaterJson: false
           uploadWorkflowArtifacts: true
           args: --target ${{ matrix.target }} --bundles ${{ matrix.bundles }} -- --locked
+      - name: Verify the macOS app signature inside the DMG
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          RELEASE_TARGET: ${{ matrix.target }}
+        run: |
+          shopt -s nullglob
+          images=(src-tauri/target/"$RELEASE_TARGET"/release/bundle/dmg/*.dmg)
+          if (( ${#images[@]} != 1 )); then
+            echo "Expected one DMG for $RELEASE_TARGET."
+            exit 1
+          fi
+          mount_dir="$(mktemp -d)"
+          cleanup() {
+            hdiutil detach "$mount_dir" >/dev/null 2>&1 || true
+            rmdir "$mount_dir" || true
+          }
+          trap cleanup EXIT
+          hdiutil attach -readonly -nobrowse -mountpoint "$mount_dir" "${images[0]}"
+          codesign --verify --deep --strict --verbose=2 "$mount_dir/MediaToolsPro.app"
 
   publish:
     name: Verify installers and publish

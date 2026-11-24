@@ -1,5 +1,10 @@
 # Historial de cambios
 
+## 0.4.2 — 2026-11-23
+
+- El instalador de macOS sella la app completa con una firma ad hoc.
+- La publicación comprueba la firma de la app dentro de los DMG de Apple Silicon e Intel.
+
 ## 0.4.1 — 2026-11-23
 
 - Nuevo icono de MediaToolsPro en el estudio y en los instaladores de escritorio.

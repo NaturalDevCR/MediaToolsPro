@@ -30,7 +30,9 @@ Los instaladores están en [GitHub Releases](https://github.com/NaturalDevCR/Med
 | Windows    | x64                                 | `.exe` o `.msi`              | Ejecuta uno de los dos instaladores.                     |
 | Linux      | x64                                 | `.deb`, `.rpm` o `.AppImage` | Usa el paquete de tu distribución o ejecuta la AppImage. |
 
-Los paquetes no incluyen firma de distribución de Apple/Microsoft ni notarización. macOS o Windows pueden mostrar un aviso de seguridad. Descarga únicamente desde las releases de este repositorio y consulta las opciones de apertura que ofrezca tu sistema.
+Los paquetes de macOS usan una firma ad hoc que sella el paquete de la app. La distribución actual carece de firma Developer ID y de notarización. Después del primer intento de apertura, macOS puede pedirte que confirmes con **Abrir igualmente** en **Ajustes del Sistema → Privacidad y seguridad**. Descarga desde las releases de este repositorio y comprueba la suma SHA-256. [Guía de Apple para abrir apps de forma segura](https://support.apple.com/es-es/102445)
+
+Los paquetes de Windows carecen de firma de distribución de Microsoft y el sistema puede mostrar un aviso de seguridad.
 
 Cada release incluye **`SHA256SUMS.txt`** para comprobar la integridad de los instaladores. Por ejemplo, compara el resultado de `shasum -a 256 nombre-del-archivo` en macOS, `sha256sum nombre-del-archivo` en Linux o `Get-FileHash nombre-del-archivo -Algorithm SHA256` en PowerShell con el valor publicado.
 
