@@ -8,7 +8,7 @@ import {
   shallowRef,
   watch,
 } from "vue";
-import { convertFileSrc, invoke, isTauri } from "@tauri-apps/api/core";
+import { Channel, convertFileSrc, invoke, isTauri } from "@tauri-apps/api/core";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
@@ -170,6 +170,7 @@ const visibleRange = computed(() =>
 const envelope = computed(() => levels.value && createWaveformEnvelope(levels.value));
 let levelsToken = 0;
 let levelsId = "";
+let finishLevelsTransfer: (() => void) | undefined;
 let resizeObserver: ResizeObserver | undefined;
 let paintFrame = 0;
 const quiet = computed(() =>
@@ -379,6 +380,8 @@ function jumpToTime() {
 async function cancelLevels() {
   levelsToken++;
   levelsBusy.value = false;
+  finishLevelsTransfer?.();
+  finishLevelsTransfer = undefined;
   if (levelsId) {
     const id = levelsId;
     levelsId = "";
@@ -396,13 +399,29 @@ async function loadLevels(path: string) {
   const id = crypto.randomUUID();
   levelsId = id;
   levelsBusy.value = true;
+  const peaksDb: number[] = [];
+  const rmsDb: number[] = [];
+  const transferComplete = new Promise<void>((resolve) => {
+    finishLevelsTransfer = resolve;
+  });
+  const onChunk = new Channel<Pick<WaveformLevelsResponse, "peaksDb" | "rmsDb"> | null>(
+    (chunk) => {
+      if (token !== levelsToken || disposed) return;
+      if (chunk === null) {
+        finishLevelsTransfer?.();
+        return;
+      }
+      peaksDb.push(...chunk.peaksDb);
+      rmsDb.push(...chunk.rmsDb);
+    },
+  );
   try {
-    const result = await invoke<WaveformLevelsResponse>("analyze_waveform", {
-      inputPath: path,
-      id,
-    });
+    const [intervalSeconds] = await Promise.all([
+      invoke<number>("analyze_waveform", { inputPath: path, id, onChunk }),
+      transferComplete,
+    ]);
     if (token !== levelsToken || disposed) return;
-    levels.value = result;
+    levels.value = { intervalSeconds, peaksDb, rmsDb };
     await nextTick();
     schedulePaint();
   } catch (e) {
@@ -411,6 +430,7 @@ async function loadLevels(path: string) {
     if (token === levelsToken) {
       levelsBusy.value = false;
       levelsId = "";
+      finishLevelsTransfer = undefined;
     }
   }
 }

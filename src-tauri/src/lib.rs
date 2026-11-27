@@ -46,6 +46,7 @@ mod binaries;
 mod encoding;
 mod jobs;
 mod media;
+mod process;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {

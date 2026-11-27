@@ -1,6 +1,6 @@
+use crate::process::background_command;
 use serde::Serialize;
 use std::collections::HashMap;
-use std::process::Command;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
@@ -138,7 +138,7 @@ pub async fn cancel_job(state: tauri::State<'_, JobState>, id: String) -> Result
 fn terminate_process(pid: u32) -> Result<(), String> {
     #[cfg(unix)]
     {
-        let status = Command::new("kill")
+        let status = background_command("kill")
             .args(["-TERM", &pid.to_string()])
             .status()
             .map_err(|error| error.to_string())?;
@@ -152,7 +152,7 @@ fn terminate_process(pid: u32) -> Result<(), String> {
 
     #[cfg(windows)]
     {
-        let status = Command::new("taskkill")
+        let status = background_command("taskkill")
             .args(["/PID", &pid.to_string(), "/T", "/F"])
             .status()
             .map_err(|error| error.to_string())?;

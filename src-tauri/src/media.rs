@@ -3,6 +3,7 @@ use crate::jobs::{
     emit_job_progress, emit_log, is_audio_format, is_video_format, media_kind_for_format,
     JobProgressPayload, JobState,
 };
+use crate::process::background_command;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
@@ -15,6 +16,7 @@ use std::sync::{
     Arc, Mutex,
 };
 use std::time::UNIX_EPOCH;
+use tauri::ipc::Channel;
 use tauri::{AppHandle, Manager, Runtime, State};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
@@ -494,7 +496,7 @@ async fn render_preview_audio<R: Runtime>(
     }
 
     let staging_path = reserve_staging_path(&output_path)?;
-    let mut command = Command::new(ffmpeg_path);
+    let mut command = ffmpeg_command(ffmpeg_path);
     command
         .args([
             "-hide_banner",
@@ -618,7 +620,7 @@ async fn run_segment_render<R: Runtime>(
     if cancelled.load(Ordering::SeqCst) {
         return Err("Cancelled by user".into());
     }
-    let mut child = Command::new(ffmpeg_path)
+    let mut child = ffmpeg_command(ffmpeg_path)
         .kill_on_drop(true)
         .args(&args)
         .stdout(Stdio::piped())
@@ -1015,7 +1017,7 @@ async fn build_chapter_segments(
     pid: &Arc<Mutex<Option<u32>>>,
     cancelled: &Arc<AtomicBool>,
 ) -> Result<Vec<Segment>, String> {
-    let mut command = Command::new(ffmpeg_path);
+    let mut command = ffmpeg_command(ffmpeg_path);
     command
         .args(["-hide_banner", "-i", &request.input_path])
         .stdout(Stdio::null())
@@ -1089,7 +1091,7 @@ async fn detect_silences(
     pid: &Arc<Mutex<Option<u32>>>,
     cancelled: &Arc<AtomicBool>,
 ) -> Result<Vec<Segment>, String> {
-    let mut command = Command::new(ffmpeg_path);
+    let mut command = ffmpeg_command(ffmpeg_path);
     command
         .args([
             "-hide_banner",
@@ -1199,8 +1201,12 @@ fn resolve_ffmpeg_path<R: Runtime>(app: &AppHandle<R>) -> Result<PathBuf, String
     crate::binaries::ffmpeg_path(app)
 }
 
+fn ffmpeg_command(path: &Path) -> Command {
+    Command::from(background_command(path))
+}
+
 async fn probe_media_info(ffmpeg_path: &Path, input_path: &str) -> Result<InputMediaInfo, String> {
-    let output = Command::new(ffmpeg_path)
+    let output = ffmpeg_command(ffmpeg_path)
         .args(["-hide_banner", "-i", input_path])
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -1779,7 +1785,7 @@ async fn render_comparison_files(
     request.split_normalization = SplitNormalization::None;
     let original = segment_render_args(&request, segment, "", &original_path, None);
     for args in [original, processed] {
-        let mut command = Command::new(ffmpeg);
+        let mut command = ffmpeg_command(ffmpeg);
         command
             .args(args)
             .stdout(Stdio::null())
@@ -1905,7 +1911,7 @@ async fn analyze_loudness(
         preprocessing,
         &format!("{target}:print_format=json"),
     );
-    let mut command = Command::new(ffmpeg);
+    let mut command = ffmpeg_command(ffmpeg);
     command
         .args([
             "-hide_banner",
@@ -1959,7 +1965,7 @@ async fn prepare_normalized_audio(
         start_seconds: selection.start_seconds,
     };
     let filter = bounded_audio_filter(selection, &preprocessing, &normalizer);
-    let mut command = Command::new(ffmpeg);
+    let mut command = ffmpeg_command(ffmpeg);
     command
         .args([
             "-hide_banner",
@@ -2556,6 +2562,57 @@ mod tests {
             assert!(sample_peak(&samples) > 0.12);
         }
     }
+
+    #[tokio::test]
+    #[ignore = "Requires FFmpeg on PATH"]
+    async fn long_waveforms_cross_ipc_in_small_ordered_messages() {
+        let fixture = Fixture::new();
+        let input = fixture.0.join("grabación larga.flac");
+        let path = input.to_str().unwrap();
+        ffmpeg(&[
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:sample_rate=8000:duration=1.02",
+            "-af",
+            "adelay=3599000:all=1",
+            path,
+        ])
+        .await;
+        let (pid, cancelled) = control();
+        let levels = cached_waveform_levels(Path::new("ffmpeg"), path, None, &pid, &cancelled)
+            .await
+            .unwrap();
+        assert_eq!(levels.interval_seconds, 0.02);
+        assert_eq!(levels.peaks_db.len(), 180_001);
+        assert_eq!(levels.peaks_db[0], -120.0);
+        assert!((levels.peaks_db.last().unwrap() + 18.0).abs() < 1.0);
+
+        let frames = Arc::new(Mutex::new(Vec::new()));
+        let received = Arc::clone(&frames);
+        let channel = Channel::new(move |body| {
+            let tauri::ipc::InvokeResponseBody::Json(json) = body else {
+                panic!("Expected waveform JSON");
+            };
+            assert!(json.len() < 8192, "IPC response has {} bytes", json.len());
+            received.lock().unwrap().push(json);
+            Ok(())
+        });
+        send_waveform_levels(&levels, &channel, &cancelled).unwrap();
+
+        let mut peaks = Vec::new();
+        let mut rms = Vec::new();
+        let mut frames = frames.lock().unwrap();
+        assert_eq!(frames.pop().as_deref(), Some("null"));
+        for frame in frames.iter() {
+            let chunk: serde_json::Value = serde_json::from_str(frame).unwrap();
+            peaks.extend(serde_json::from_value::<Vec<f32>>(chunk["peaksDb"].clone()).unwrap());
+            rms.extend(serde_json::from_value::<Vec<f32>>(chunk["rmsDb"].clone()).unwrap());
+        }
+        assert_eq!(peaks, levels.peaks_db);
+        assert_eq!(rms, levels.rms_db);
+    }
+
     #[tokio::test]
     #[ignore = "Requires FFmpeg on PATH"]
     async fn ffmpeg_chapters_keep_short_chapters_and_never_fall_back_to_silence() {
@@ -2909,25 +2966,60 @@ pub struct WaveformLevelsResponse {
     rms_db: Vec<f32>,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct WaveformLevelsChunk {
+    peaks_db: Vec<f32>,
+    rms_db: Vec<f32>,
+}
+
+fn send_waveform_levels(
+    levels: &WaveformLevelsResponse,
+    channel: &Channel<Option<WaveformLevelsChunk>>,
+    cancelled: &AtomicBool,
+) -> Result<(), String> {
+    // Stay below Tauri's 8 KiB cutoff for channel messages delivered directly to the webview.
+    const SAMPLES_PER_CHUNK: usize = 240;
+    for (peaks, rms) in levels
+        .peaks_db
+        .chunks(SAMPLES_PER_CHUNK)
+        .zip(levels.rms_db.chunks(SAMPLES_PER_CHUNK))
+    {
+        if cancelled.load(Ordering::SeqCst) {
+            return Err("Cancelled by user".into());
+        }
+        channel
+            .send(Some(WaveformLevelsChunk {
+                peaks_db: peaks.to_vec(),
+                rms_db: rms.to_vec(),
+            }))
+            .map_err(|error| error.to_string())?;
+    }
+    channel.send(None).map_err(|error| error.to_string())
+}
+
 #[tauri::command]
 #[allow(non_snake_case)]
-pub async fn analyze_waveform<R: Runtime>(
+pub(crate) async fn analyze_waveform<R: Runtime>(
     app: AppHandle<R>,
     state: State<'_, JobState>,
     inputPath: String,
     id: String,
-) -> Result<WaveformLevelsResponse, String> {
+    on_chunk: Channel<Option<WaveformLevelsChunk>>,
+) -> Result<f64, String> {
     let (pid, cancelled) = state.register(&id)?;
     let result = async {
         let ffmpeg = resolve_ffmpeg_path(&app)?;
-        cached_waveform_levels(
+        let levels = cached_waveform_levels(
             &ffmpeg,
             &inputPath,
             waveform_cache_dir(&app).as_deref(),
             &pid,
             &cancelled,
         )
-        .await
+        .await?;
+        send_waveform_levels(&levels, &on_chunk, &cancelled)?;
+        Ok(levels.interval_seconds)
     }
     .await;
     state.remove(&id);
@@ -2979,7 +3071,7 @@ async fn measure_waveform_levels(
     pid: &Arc<Mutex<Option<u32>>>,
     cancelled: &Arc<AtomicBool>,
 ) -> Result<WaveformLevelsResponse, String> {
-    let mut command = Command::new(ffmpeg);
+    let mut command = ffmpeg_command(ffmpeg);
     command.args(["-hide_banner", "-nostdin", "-loglevel", "error", "-i", input, "-map", "0:a:0", "-vn",
         "-af", "aresample=48000:async=1:first_pts=0,asetnsamples=n=960:p=0,astats=metadata=1:reset=1:measure_perchannel=none:measure_overall=Peak_level+RMS_level,ametadata=print:file=-", "-f", "null", "-"])
         .stdout(Stdio::piped()).stderr(Stdio::piped());

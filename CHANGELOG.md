@@ -1,5 +1,10 @@
 # Historial de cambios
 
+## 0.5.1 — 2026-11-27
+
+- Windows ejecuta FFmpeg en segundo plano para evitar las ventanas de consola al importar audio.
+- La forma de onda de grabaciones largas se carga en bloques y conserva las mediciones cada 20 ms.
+
 ## 0.5.0 — 2026-11-23
 
 - Detección de pausas adaptada a los niveles del audio, con sensibilidad y análisis automático opcional.

@@ -1,5 +1,6 @@
+use crate::process::background_command;
 use serde::Serialize;
-use std::{fs, path::PathBuf, process::Command, time::Duration};
+use std::{fs, path::PathBuf, time::Duration};
 use tauri::{AppHandle, Manager, Runtime};
 
 #[derive(Serialize)]
@@ -33,7 +34,7 @@ pub fn ffmpeg_path<R: Runtime>(app: &AppHandle<R>) -> Result<PathBuf, String> {
     candidates
         .into_iter()
         .find(|path| {
-            Command::new(path)
+            background_command(path)
                 .arg("-version")
                 .output()
                 .is_ok_and(|o| o.status.success())
@@ -44,7 +45,7 @@ pub fn ffmpeg_path<R: Runtime>(app: &AppHandle<R>) -> Result<PathBuf, String> {
 pub async fn check_binaries<R: Runtime>(app: AppHandle<R>) -> BinaryStatus {
     let version = ffmpeg_path(&app)
         .ok()
-        .and_then(|path| Command::new(path).arg("-version").output().ok())
+        .and_then(|path| background_command(path).arg("-version").output().ok())
         .and_then(|o| {
             String::from_utf8_lossy(&o.stdout)
                 .lines()
@@ -109,7 +110,7 @@ pub async fn install_ffmpeg<R: Runtime>(app: AppHandle<R>) -> Result<(), String>
         fs::set_permissions(&staging, fs::Permissions::from_mode(0o755))
             .map_err(|e| e.to_string())?;
     }
-    let valid = Command::new(&staging)
+    let valid = background_command(&staging)
         .arg("-version")
         .output()
         .is_ok_and(|o| o.status.success());
