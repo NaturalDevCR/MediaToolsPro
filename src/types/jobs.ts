@@ -99,5 +99,10 @@ export interface WaveformLevelsResponse {
 
 export interface SplitComparison {
   originalPath: string;
-  processedPath: string;
+  processedPath?: string;
+}
+
+export interface SplitComparisonUpdate {
+  percent: number;
+  originalPath?: string;
 }

@@ -30,6 +30,7 @@ import {
   RotateCcw,
   Scissors,
   Split,
+  Square,
   Upload,
   X,
 } from "lucide-vue-next";
@@ -38,6 +39,7 @@ import SplitComparisonPlayer from "../components/SplitComparisonPlayer.vue";
 import ExportOptions from "../components/ExportOptions.vue";
 import { compatibleEncoding } from "../lib/export-options";
 import { t, tMediaMessage } from "../lib/i18n";
+import { formatPlaybackTime as time } from "../lib/playback";
 import {
   basename,
   cancelItem,
@@ -57,6 +59,7 @@ import type {
   Segment,
   SilenceSensitivity,
   SplitComparison,
+  SplitComparisonUpdate,
   SplitMode,
   SplitNormalization,
   SplitPlan,
@@ -436,6 +439,9 @@ async function loadLevels(path: string) {
 }
 const cursor = ref(0);
 const playing = ref(false);
+const playbackStarting = ref(false);
+const playbackActive = computed(() => playing.value || playbackStarting.value);
+const playbackSegment = shallowRef<Segment>();
 const loop = ref(false);
 const start = ref("00:00.000");
 const end = ref("");
@@ -472,8 +478,10 @@ const comparison = ref<SplitComparison>();
 const comparisonSegment = ref<Segment>();
 const comparisonIndex = ref(0);
 const comparisonPending = ref(false);
+const comparisonPercent = ref(0);
 const comparisonError = ref("");
 const comparisonPlayer = ref<InstanceType<typeof SplitComparisonPlayer>>();
+const comparisonPanel = ref<HTMLElement>();
 let comparisonId = "";
 const splitNormalization = ref<SplitNormalization>("none");
 const splitModes = {
@@ -562,13 +570,6 @@ let stopDrop: (() => void) | undefined;
 let stopDrag: (() => void) | undefined;
 let disposed = false;
 
-function time(seconds: number) {
-  const ms = Math.max(0, Math.round(seconds * 1000));
-  const h = Math.floor(ms / 3600000);
-  const m = Math.floor(ms / 60000) % 60;
-  const s = Math.floor(ms / 1000) % 60;
-  return `${h ? `${String(h).padStart(2, "0")}:` : ""}${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}.${String(ms % 1000).padStart(3, "0")}`;
-}
 function parse(value: string): number | null {
   const parts = value.trim().split(":");
   if (!value.trim() || parts.length > 3) return null;
@@ -646,14 +647,17 @@ const formats = computed(() =>
     ? videoFormats
     : audioFormats,
 );
-const splitEffectProblem = computed(() => {
+const splitFadeProblem = computed(() => {
   if (!Number.isFinite(splitFades.value.in) || !Number.isFinite(splitFades.value.out) ||
       splitFades.value.in < 0 || splitFades.value.out < 0)
     return "Introduce fades de entrada y salida de 0 s o más.";
-  if (splitNormalization.value !== "none" && !loudnessValid.value)
-    return "Revisa los objetivos de sonoridad y true peak.";
   return "";
 });
+const splitEffectProblem = computed(() => splitFadeProblem.value || (
+  splitNormalization.value !== "none" && !loudnessValid.value
+    ? "Revisa los objetivos de sonoridad y true peak."
+    : ""
+));
 const exportProblem = computed(() => {
   if (!sources.value.length) return "Importa un archivo para empezar.";
   if (!queueReady.value)
@@ -738,9 +742,16 @@ function removeSource(path: string) {
     selectedPath.value = sources.value[0]?.path || "";
 }
 function stopPlayback() {
+  playbackRequest++;
+  playbackStarting.value = false;
   cancelAnimationFrame(animationFrame);
   audio.value?.pause();
   playing.value = false;
+}
+function resetPlayback() {
+  stopPlayback();
+  comparisonPlayer.value?.stop();
+  seek(playbackSegment.value?.startSeconds ?? startSeconds.value ?? 0);
 }
 function seek(seconds: number) {
   cursor.value = Math.max(0, Math.min(duration.value, seconds));
@@ -753,21 +764,29 @@ function seek(seconds: number) {
     }
   }
 }
-async function playRegion(regionStart: number, regionEnd: number) {
-  if (!audio.value || !preview.value) return;
+let playbackRequest = 0;
+async function playRegion(regionStart: number, regionEnd: number, from = regionStart) {
+  const element = audio.value;
+  if (!element || !preview.value) return;
   comparisonPlayer.value?.pause();
+  const request = ++playbackRequest;
   playbackEnd = regionEnd;
   playbackStart = regionStart;
-  seek(regionStart);
+  seek(from);
+  playbackStarting.value = true;
   try {
-    await audio.value.play();
-    playing.value = true;
+    await element.play();
   } catch (e) {
-    previewError.value = t("No se pudo reproducir la preescucha: {error}", { error: String(e) });
+    if (request === playbackRequest) {
+      previewError.value = t("No se pudo reproducir la preescucha: {error}", { error: String(e) });
+    }
+  } finally {
+    if (request === playbackRequest) playbackStarting.value = false;
   }
 }
 let animationFrame = 0;
 function onAudioPlay() {
+  if (audio.value?.paused !== false) return;
   playing.value = true;
   cancelAnimationFrame(animationFrame);
   const frame = () => {
@@ -776,22 +795,47 @@ function onAudioPlay() {
   };
   animationFrame = requestAnimationFrame(frame);
 }
+function onAudioPause() {
+  if (audio.value?.paused) {
+    playing.value = false;
+    cancelAnimationFrame(animationFrame);
+  }
+}
 let playbackStart = 0;
 let playbackEnd = 0;
 function togglePlayback() {
-  if (playing.value) {
+  if (playbackActive.value) {
     stopPlayback();
+    return;
+  }
+  if (playbackSegment.value) {
+    toggleSegmentPlayback(playbackSegment.value);
     return;
   }
   const regionStart = selectionValid.value ? startSeconds.value! : 0;
   const regionEnd = selectionValid.value ? endSeconds.value! : duration.value;
   void playRegion(
+    regionStart,
+    regionEnd,
     cursor.value >= regionStart && cursor.value < regionEnd - 0.01
       ? cursor.value
       : regionStart,
-    regionEnd,
   );
-  playbackStart = regionStart;
+}
+function toggleSegmentPlayback(segment: Segment) {
+  const isCurrent = playbackSegment.value === segment;
+  if (isCurrent && playbackActive.value) {
+    stopPlayback();
+    return;
+  }
+  playbackSegment.value = segment;
+  const from = isCurrent && cursor.value >= segment.startSeconds && cursor.value < segment.endSeconds
+    ? cursor.value
+    : segment.startSeconds;
+  void playRegion(segment.startSeconds, segment.endSeconds, from);
+}
+function segmentElapsed(segment: Segment) {
+  return Math.max(0, Math.min(cursor.value, segment.endSeconds) - segment.startSeconds);
 }
 function updateTime() {
   if (!audio.value) return;
@@ -1018,47 +1062,63 @@ function splitRequest(path: string, splitSegments: Segment[]) {
 function invalidateComparison() {
   const id = comparisonId;
   const pending = comparisonPending.value;
-  const ready = Boolean(comparison.value);
   comparisonPlayer.value?.pause();
   comparisonId = "";
   comparison.value = undefined;
   comparisonSegment.value = undefined;
   comparisonPending.value = false;
+  comparisonPercent.value = 0;
   comparisonError.value = "";
   if (pending) void invoke("cancel_job", { id }).catch(() => {});
-  if (ready) void nextTick().then(() => invoke("remove_split_comparison", { id })).catch(() => {});
+  else if (id) void nextTick().then(() => invoke("remove_split_comparison", { id })).catch(() => {});
 }
 
 async function compareSegment(segment: Segment, index: number) {
   invalidateComparison();
   comparisonSegment.value = segment;
   comparisonIndex.value = index + 1;
-  if (splitEffectProblem.value) {
-    comparisonError.value = splitEffectProblem.value;
+  if (splitFadeProblem.value) {
+    comparisonError.value = splitFadeProblem.value;
     return;
   }
   stopPlayback();
   const id = crypto.randomUUID();
   comparisonId = id;
   comparisonPending.value = true;
+  void nextTick(() => {
+    if (id === comparisonId) comparisonPanel.value?.scrollIntoView({ block: "nearest" });
+  });
+  const onUpdate = new Channel<SplitComparisonUpdate>(({ percent, originalPath }) => {
+    if (id !== comparisonId) return;
+    comparisonPercent.value = Math.max(comparisonPercent.value, percent);
+    if (originalPath && !comparison.value) comparison.value = { originalPath };
+  });
+  const { inputPath, trimStart, trimEnd, eq, fadeInDuration, fadeOutDuration } = baseRequest(selectedPath.value);
   try {
     const result = await invoke<SplitComparison>("render_split_comparison", {
       request: {
-        ...splitRequest(selectedPath.value, segments.value),
         id,
-        outputNamePattern: undefined,
+        inputPath,
+        trimStart,
+        trimEnd,
+        eq,
+        fadeInDuration,
+        fadeOutDuration,
+        format: "wav",
+        normalize: false,
       },
       segment,
+      onUpdate,
     });
-    if (id !== comparisonId) {
-      await invoke("remove_split_comparison", { id });
-      return;
+    if (id === comparisonId) {
+      comparison.value = result;
+      comparisonPercent.value = 100;
     }
-    comparison.value = result;
   } catch (error) {
     if (id === comparisonId) comparisonError.value = String(error);
   } finally {
     if (id === comparisonId) comparisonPending.value = false;
+    else await nextTick().then(() => invoke("remove_split_comparison", { id })).catch(() => {});
   }
 }
 async function invalidateAnalysis() {
@@ -1242,6 +1302,7 @@ watch(selectedPath, async (path) => {
   hoverTime.value = null;
   lastInspectedTime.value = null;
   stopPlayback();
+  playbackSegment.value = undefined;
   stopDrag?.();
   void invalidateAnalysis();
   preview.value = undefined;
@@ -1281,7 +1342,10 @@ watch(levelsBusy, (busy) => {
     scheduleAutomaticAnalysis();
   }
 });
-watch([start, end], stopPlayback);
+watch([start, end, segments], () => {
+  stopPlayback();
+  playbackSegment.value = undefined;
+});
 watch(showQueue, (value) => {
   if (value) {
     stopPlayback();
@@ -1291,10 +1355,11 @@ watch(showQueue, (value) => {
 watch([tool, selectedPath, formats], () => {
   if (selected.value?.probe && !formats.value.includes(format.value)) format.value = formats.value[0];
   stopPlayback();
+  if (tool.value !== "split") playbackSegment.value = undefined;
 });
 watch(
   [tool, selectedPath, start, end, segments, () => splitFades.value.in,
-    () => splitFades.value.out, splitNormalization, loudness, truePeak],
+    () => splitFades.value.out],
   invalidateComparison,
 );
 watch(
@@ -1598,15 +1663,18 @@ onUnmounted(() => {
                 <div class="transport">
                   <button
                     class="play-button"
-                    :disabled="!preview || !selectionValid"
-                    :aria-label="t(playing ? 'Pausar' : 'Reproducir selección')"
+                    :disabled="!preview || (!selectionValid && !playbackActive)"
+                    :aria-label="t(playbackActive ? 'Pausar' : 'Reproducir selección')"
+                    :title="t(playbackActive ? 'Pausar' : 'Reproducir selección')"
                     @click="togglePlayback"
                   >
-                    <Pause v-if="playing" :size="17" /><Play
+                    <Pause v-if="playbackActive" :size="17" /><Play
                       v-else
                       :size="17"
-                    /></button
-                  ><span class="timecode">{{ time(cursor) }}</span
+                    /></button>
+                  <button class="icon-button" :disabled="!preview && !comparison" :aria-label="t('Detener reproducción')"
+                    :title="t('Detener reproducción')" @click="resetPlayback"><Square :size="14" /></button>
+                  <span class="timecode">{{ time(cursor) }}</span
                   ><span class="time-total">/ {{ time(duration) }}</span>
                 </div>
                 <div class="transport">
@@ -1871,11 +1939,12 @@ onUnmounted(() => {
                 ref="audio"
                 :src="audioUrl"
                 preload="metadata"
-                @play="onAudioPlay"
+                @playing="onAudioPlay"
                 @timeupdate="updateTime"
                 @ended="ended"
-                @pause="playing = false"
+                @pause="onAudioPause"
                 @error="
+                  stopPlayback();
                   previewError = 'No se pudo cargar el audio de preescucha.'
                 "
               />
@@ -2166,6 +2235,7 @@ onUnmounted(() => {
                       v-for="(segment, i) in segments"
                       :key="segment.startSeconds"
                       class="segment-row"
+                      :class="{ 'segment-current': playbackSegment === segment }"
                     >
                       <span class="segment-number">{{
                         String(i + 1).padStart(2, "0")
@@ -2180,13 +2250,12 @@ onUnmounted(() => {
                       ><button
                         class="icon-button"
                         :disabled="!preview"
-                        :aria-label="t('Escuchar segmento {index}', { index: i + 1 })"
-                        :title="t('Escuchar segmento')"
-                        @click="
-                          playRegion(segment.startSeconds, segment.endSeconds)
-                        "
+                        :aria-label="t(playbackSegment === segment && playbackActive ? 'Pausar segmento {index}' : 'Escuchar segmento {index}', { index: i + 1 })"
+                        :title="t(playbackSegment === segment && playbackActive ? 'Pausar' : 'Escuchar segmento')"
+                        @click="toggleSegmentPlayback(segment)"
                       >
-                        <Play :size="14" />
+                        <Pause v-if="playbackSegment === segment && playbackActive" :size="14" />
+                        <Play v-else :size="14" />
                       </button>
                       <button
                         class="comparison-button"
@@ -2197,18 +2266,30 @@ onUnmounted(() => {
                       >
                         A/B
                       </button>
+                      <div v-if="playbackSegment === segment" class="segment-playback">
+                        <progress :value="segmentElapsed(segment)" :max="segment.endSeconds - segment.startSeconds"
+                          :aria-label="t('Avance del segmento {index}', { index: i + 1 })" />
+                        <span>{{ time(segmentElapsed(segment)) }} / {{ time(segment.endSeconds - segment.startSeconds) }}</span>
+                      </div>
                     </div>
                   </div>
-                  <div v-if="comparisonSegment" class="segment-comparison">
+                  <div v-if="comparisonSegment" ref="comparisonPanel" class="segment-comparison">
                     <div class="comparison-title">
                       <h3>{{ t('Preescucha A/B · segmento') }} {{ comparisonIndex }}</h3>
                       <button class="icon-button" :aria-label="t('Cerrar comparación')" @click="invalidateComparison">
                         <X :size="14" />
                       </button>
                     </div>
-                    <p v-if="comparisonPending" class="comparison-status" role="status">
-                      <LoaderCircle :size="14" class="spin" /> {{ t('Preparando el audio original y procesado…') }}
-                    </p>
+                    <div v-if="comparisonPending" class="comparison-render-progress">
+                      <div class="comparison-status">
+                        <p role="status">{{ t(comparison ? 'Preparando la versión B…' : 'Preparando la versión A…') }}</p>
+                        <span class="timecode">{{ comparisonPercent }}%</span>
+                      </div>
+                      <div class="progress-track" role="progressbar" :aria-label="t('Progreso de la preescucha A/B')"
+                        aria-valuemin="0" aria-valuemax="100" :aria-valuenow="comparisonPercent">
+                        <span :style="{ width: `${comparisonPercent}%` }" />
+                      </div>
+                    </div>
                     <p v-if="comparisonError" class="comparison-status error-text" role="alert">{{ tMediaMessage(comparisonError) }}</p>
                     <SplitComparisonPlayer v-if="comparison" ref="comparisonPlayer"
                       :comparison="comparison"

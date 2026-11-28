@@ -1065,6 +1065,27 @@ kbd {
   flex: 1;
   white-space: nowrap;
 }
+.segment-row.segment-current {
+  flex-wrap: wrap;
+}
+.segment-current .segment-number {
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+.segment-playback {
+  display: flex;
+  flex: 0 0 100%;
+  align-items: center;
+  gap: 8px;
+  color: var(--muted);
+  font-size: 10px;
+}
+.segment-playback progress {
+  flex: 1;
+  min-width: 0;
+  height: 6px;
+  accent-color: var(--accent);
+}
 .segment-row small {
   font-size: 9px;
   color: var(--muted);
@@ -1098,6 +1119,16 @@ kbd {
 .comparison-actions .split-mode-tabs {
   flex: 1;
 }
+.comparison-transport {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 8px;
+}
+.comparison-transport .timecode {
+  margin-left: auto;
+}
 .comparison-status {
   color: var(--muted);
   font-size: 11px;
@@ -1106,7 +1137,19 @@ kbd {
 .comparison-status.error-text {
   color: var(--danger);
 }
-.comparison-player input[type="range"] {
+.comparison-render-progress {
+  margin: 8px 0;
+}
+.comparison-render-progress .comparison-status {
+  justify-content: space-between;
+}
+.comparison-render-progress .progress-track {
+  height: 5px;
+  margin-top: 6px;
+}
+.comparison-progress {
+  display: block;
+  width: 100%;
   margin-top: 8px;
   padding: 0;
   accent-color: var(--accent);

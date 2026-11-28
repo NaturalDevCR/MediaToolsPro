@@ -94,7 +94,7 @@ Revisa y escucha los segmentos. **Ajustar manualmente** copia los cortes generad
 
 Puedes aplicar **Normalización de sonoridad** antes de dividir para medir y ajustar toda la selección en conjunto, o después de dividir para medir y ajustar cada segmento con sus fades. Elige un preset o ajusta los objetivos de LUFS y true peak. Pulsa **Exportar segmentos** para aplicar toda la configuración.
 
-Usa **A/B** junto al segmento para alternar entre el audio original y el procesado en la misma posición. La preescucha usa audio WAV con los fades y la normalización que hayas configurado.
+Usa **A/B** junto al segmento para alternar entre el audio original y el audio con fades en la misma posición. La preescucha muestra el avance de la preparación del audio WAV. La normalización se aplica al exportar.
 
 En **Exportación** puedes usar un patrón como `Pista-{numero} - {archivo}`. La aplicación añade la extensión y mantiene nombres disponibles si hay una coincidencia. Guarda el flujo con **Guardar preset** y recupéralo desde **Preset de Split** cuando abras otro archivo. Las marcas manuales se definen para cada archivo.
 

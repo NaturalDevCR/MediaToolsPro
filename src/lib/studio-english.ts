@@ -54,7 +54,6 @@ export const studioEnglish: Record<string, string> = {
   "segmento(s)": "segment(s)",
   "Ajustar manualmente": "Adjust cuts manually",
   "Preescucha A/B · segmento": "A/B preview · segment",
-  "Preparando el audio original y procesado…": "Preparing original and processed audio…",
   "Fade de entrada": "Fade in",
   "Fade de salida": "Fade out",
   "Normalización de sonoridad": "Loudness normalization",

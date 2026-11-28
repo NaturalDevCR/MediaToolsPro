@@ -1,5 +1,11 @@
 # Historial de cambios
 
+## 0.5.2 — 2026-11-27
+
+- La preescucha A/B compara el corte original con sus fades al volumen original. La normalización se aplica al exportar.
+- La preparación de A/B muestra una barra y un porcentaje. El corte original se puede reproducir mientras se prepara la versión B.
+- La reproducción de segmentos muestra el tiempo y el avance, con controles para pausar, reanudar y detener.
+
 ## 0.5.1 — 2026-11-27
 
 - Windows ejecuta FFmpeg en segundo plano para evitar las ventanas de consola al importar audio.

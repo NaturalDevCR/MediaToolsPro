@@ -181,6 +181,14 @@ pub struct SplitComparison {
     processed_path: String,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SplitComparisonUpdate {
+    percent: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    original_path: Option<String>,
+}
+
 struct NormalizedAudio {
     path: PathBuf,
     start_seconds: f64,
@@ -617,12 +625,58 @@ async fn run_segment_render<R: Runtime>(
         normalized_audio,
     );
 
+    let output_label = output_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| output_path.to_string_lossy().to_string());
+    run_ffmpeg_render(ffmpeg_path, &args, &pid, &cancelled, |out_time, speed| {
+        let segment_progress = if segment_duration > 0.0 {
+            (out_time / segment_duration).clamp(0.0, 0.995)
+        } else {
+            0.0
+        };
+        let overall_percent =
+            (segment_index as f64 + segment_progress) / segment_count as f64 * 100.0;
+        emit_job_progress(
+            app,
+            JobProgressPayload {
+                id: request.id.clone(),
+                job_kind: "process".into(),
+                media_kind: media_kind_for_format(&request.format).into(),
+                status: "processing".into(),
+                percent: overall_percent,
+                speed: speed.to_owned(),
+                eta: format_seconds((segment_duration - out_time).max(0.0)),
+                total_size: format!("{}/{}", segment_index + 1, segment_count),
+                title: Some(file_name.to_string()),
+                detail: Some(format!(
+                    "Segment {}/{} -> {}",
+                    segment_index + 1,
+                    segment_count,
+                    output_label
+                )),
+                output_path: Some(output_path.to_string_lossy().into_owned()),
+                error: None,
+            },
+        );
+    })
+    .await
+}
+
+async fn run_ffmpeg_render(
+    ffmpeg_path: &Path,
+    args: &[String],
+    pid: &Arc<Mutex<Option<u32>>>,
+    cancelled: &Arc<AtomicBool>,
+    mut on_progress: impl FnMut(f64, &str),
+) -> Result<(), String> {
     if cancelled.load(Ordering::SeqCst) {
         return Err("Cancelled by user".into());
     }
     let mut child = ffmpeg_command(ffmpeg_path)
         .kill_on_drop(true)
-        .args(&args)
+        .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -658,17 +712,10 @@ async fn run_segment_render<R: Runtime>(
     let mut lines = BufReader::new(stdout).lines();
 
     let mut speed = "-".to_string();
-    let output_label = output_path
-        .file_name()
-        .and_then(|value| value.to_str())
-        .map(str::to_string)
-        .unwrap_or_else(|| output_path.to_string_lossy().to_string());
-
     while let Ok(Some(line)) = lines.next_line().await {
         if cancelled.load(Ordering::SeqCst) {
             let _ = child.kill().await;
-            let _ = stderr_task.await;
-            return Err("Cancelled by user".into());
+            break;
         }
 
         if let Some((key, value)) = line.split_once('=') {
@@ -676,40 +723,7 @@ async fn run_segment_render<R: Runtime>(
                 "speed" => {
                     speed = value.trim().to_string();
                 }
-                "out_time" => {
-                    let out_time = parse_ffmpeg_time(value).unwrap_or(0.0);
-                    let segment_progress = if segment_duration > 0.0 {
-                        ((out_time / segment_duration) * 100.0).clamp(0.0, 99.5)
-                    } else {
-                        0.0
-                    };
-                    let overall_percent = (((segment_index as f64) + (segment_progress / 100.0))
-                        / segment_count as f64)
-                        * 100.0;
-
-                    emit_job_progress(
-                        app,
-                        JobProgressPayload {
-                            id: request.id.clone(),
-                            job_kind: "process".into(),
-                            media_kind: media_kind_for_format(&request.format).into(),
-                            status: "processing".into(),
-                            percent: overall_percent,
-                            speed: speed.clone(),
-                            eta: format_seconds((segment_duration - out_time).max(0.0)),
-                            total_size: format!("{}/{}", segment_index + 1, segment_count),
-                            title: Some(file_name.to_string()),
-                            detail: Some(format!(
-                                "Segment {}/{} -> {}",
-                                segment_index + 1,
-                                segment_count,
-                                output_label
-                            )),
-                            output_path: Some(output_path.to_string_lossy().to_string()),
-                            error: None,
-                        },
-                    );
-                }
+                "out_time" => on_progress(parse_ffmpeg_time(value).unwrap_or(0.0), &speed),
                 "progress" if value.trim() == "end" => {
                     break;
                 }
@@ -1685,11 +1699,12 @@ fn split_comparison_dir<R: Runtime>(app: &AppHandle<R>, id: &str) -> Result<Path
 }
 
 #[tauri::command]
-pub async fn render_split_comparison<R: Runtime>(
+pub(crate) async fn render_split_comparison<R: Runtime>(
     app: AppHandle<R>,
     state: State<'_, JobState>,
     request: ProcessMediaRequest,
     segment: Segment,
+    on_update: Channel<SplitComparisonUpdate>,
 ) -> Result<SplitComparison, String> {
     validate_request(&request)?;
     let directory = split_comparison_dir(&app, &request.id)?;
@@ -1710,24 +1725,26 @@ pub async fn render_split_comparison<R: Runtime>(
         {
             return Err("El segmento de preescucha debe estar dentro de la selección.".into());
         }
-        let selection = Segment {
-            start_seconds,
-            end_seconds,
-        };
         let parent = directory.parent().unwrap();
         fs::create_dir_all(parent).map_err(|err| err.to_string())?;
         fs::create_dir(&directory).map_err(|err| err.to_string())?;
+        let mut original_ready = false;
         let result = render_comparison_files(
             &ffmpeg,
             request.clone(),
-            &selection,
             &segment,
             &directory,
             &pid,
             &cancelled,
+            |update| {
+                let announces_original = update.original_path.is_some();
+                if on_update.send(update).is_ok() && announces_original {
+                    original_ready = true;
+                }
+            },
         )
         .await;
-        if result.is_err() {
+        if result.is_err() && (!original_ready || cancelled.load(Ordering::SeqCst)) {
             let _ = fs::remove_dir_all(&directory);
         }
         result
@@ -1749,56 +1766,86 @@ pub fn remove_split_comparison<R: Runtime>(app: AppHandle<R>, id: String) -> Res
 async fn render_comparison_files(
     ffmpeg: &Path,
     mut request: ProcessMediaRequest,
-    selection: &Segment,
     segment: &Segment,
     directory: &Path,
     pid: &Arc<Mutex<Option<u32>>>,
     cancelled: &Arc<AtomicBool>,
+    mut report: impl FnMut(SplitComparisonUpdate),
 ) -> Result<SplitComparison, String> {
     request.format = "wav".into();
     request.audio_target = None;
     request.encoding = None;
-    let original_path = directory.join("A.wav");
-    let processed_path = directory.join("B.wav");
-    let normalized_audio = if request.split_normalization == SplitNormalization::Before {
-        prepare_normalized_audio(ffmpeg, &request, selection, directory, pid, cancelled).await?
-    } else {
-        None
-    };
-    let filter = segment_audio_filter(
-        ffmpeg,
-        &request,
-        segment,
-        normalized_audio.is_some(),
-        pid,
-        cancelled,
-    )
-    .await?;
-    let processed = segment_render_args(
-        &request,
-        segment,
-        &filter,
-        &processed_path,
-        normalized_audio.as_ref(),
-    );
     request.normalize = false;
     request.split_normalization = SplitNormalization::None;
-    let original = segment_render_args(&request, segment, "", &original_path, None);
-    for args in [original, processed] {
-        let mut command = ffmpeg_command(ffmpeg);
-        command
-            .args(args)
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped());
-        let output = tracked_output(&mut command, pid, cancelled).await?;
-        if !output.status.success() {
-            return Err(String::from_utf8_lossy(&output.stderr).into_owned());
-        }
+    let original_path = directory.join("A.wav");
+    let filter = segment_preprocessing(&request, segment, false);
+    let original_finished = if filter.is_empty() { 100 } else { 50 };
+    let duration = segment.end_seconds - segment.start_seconds;
+    render_comparison_clip(
+        ffmpeg,
+        &segment_render_args(&request, segment, "", &original_path, None),
+        duration,
+        0..original_finished,
+        pid,
+        cancelled,
+        &mut report,
+    )
+    .await?;
+    let original_path = original_path.to_string_lossy().into_owned();
+    report(SplitComparisonUpdate {
+        percent: original_finished,
+        original_path: Some(original_path.clone()),
+    });
+    if filter.is_empty() {
+        return Ok(SplitComparison {
+            processed_path: original_path.clone(),
+            original_path,
+        });
     }
+    let processed_path = directory.join("B.wav");
+    render_comparison_clip(
+        ffmpeg,
+        &segment_render_args(&request, segment, &filter, &processed_path, None),
+        duration,
+        original_finished..100,
+        pid,
+        cancelled,
+        &mut report,
+    )
+    .await?;
+    report(SplitComparisonUpdate {
+        percent: 100,
+        original_path: None,
+    });
     Ok(SplitComparison {
-        original_path: original_path.to_string_lossy().into_owned(),
+        original_path,
         processed_path: processed_path.to_string_lossy().into_owned(),
     })
+}
+
+async fn render_comparison_clip(
+    ffmpeg: &Path,
+    args: &[String],
+    duration: f64,
+    progress: std::ops::Range<u32>,
+    pid: &Arc<Mutex<Option<u32>>>,
+    cancelled: &Arc<AtomicBool>,
+    mut report: impl FnMut(SplitComparisonUpdate),
+) -> Result<(), String> {
+    let mut last_percent = progress.start;
+    run_ffmpeg_render(ffmpeg, args, pid, cancelled, |elapsed, _speed| {
+        let rendered = (elapsed / duration).clamp(0.0, 1.0);
+        let percent = progress.start + (rendered * f64::from(progress.end - progress.start)) as u32;
+        let percent = percent.min(progress.end - 1);
+        if percent > last_percent {
+            last_percent = percent;
+            report(SplitComparisonUpdate {
+                percent,
+                original_path: None,
+            });
+        }
+    })
+    .await
 }
 
 fn reserve_staging_path(output: &Path) -> Result<PathBuf, String> {
@@ -1999,14 +2046,11 @@ async fn prepare_normalized_audio(
     Ok(Some(audio))
 }
 
-async fn segment_audio_filter(
-    ffmpeg: &Path,
+fn segment_preprocessing(
     request: &ProcessMediaRequest,
     segment: &Segment,
     has_normalized_audio: bool,
-    pid: &Arc<Mutex<Option<u32>>>,
-    cancelled: &Arc<AtomicBool>,
-) -> Result<String, String> {
+) -> String {
     let mut filters = if has_normalized_audio {
         Vec::new()
     } else {
@@ -2016,7 +2060,18 @@ async fn segment_audio_filter(
         request,
         segment.end_seconds - segment.start_seconds,
     ));
-    let preprocessing = filters.join(",");
+    filters.join(",")
+}
+
+async fn segment_audio_filter(
+    ffmpeg: &Path,
+    request: &ProcessMediaRequest,
+    segment: &Segment,
+    has_normalized_audio: bool,
+    pid: &Arc<Mutex<Option<u32>>>,
+    cancelled: &Arc<AtomicBool>,
+) -> Result<String, String> {
+    let preprocessing = segment_preprocessing(request, segment, has_normalized_audio);
     if request.normalizes_each_segment() {
         if let Some(normalizer) =
             analyze_loudness(ffmpeg, request, segment, &preprocessing, pid, cancelled).await?
@@ -2833,7 +2888,49 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "Requires FFmpeg on PATH"]
-    async fn split_comparison_uses_the_same_segment_with_dry_and_processed_audio() {
+    async fn split_comparison_with_no_effects_reuses_the_original_clip() {
+        let fixture = Fixture::new();
+        let source = fixture.0.join("source.wav");
+        ffmpeg(&[
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=duration=2",
+            source.to_str().unwrap(),
+        ])
+        .await;
+        let segment = Segment {
+            start_seconds: 0.5,
+            end_seconds: 1.5,
+        };
+        let mut request = request(&source);
+        request.split_mode = SplitMode::Manual;
+        request.split_normalization = SplitNormalization::Before;
+        let (pid, cancelled) = control();
+        let comparison = render_comparison_files(
+            Path::new("ffmpeg"),
+            request,
+            &segment,
+            &fixture.0,
+            &pid,
+            &cancelled,
+            |_| {},
+        )
+        .await
+        .unwrap();
+        assert_eq!(comparison.original_path, comparison.processed_path);
+        assert!(!fixture.0.join("B.wav").exists());
+        assert_eq!(
+            read_samples(Path::new(&comparison.original_path))
+                .await
+                .len(),
+            44_100
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires FFmpeg on PATH"]
+    async fn split_comparison_previews_fades_at_original_loudness() {
         let fixture = Fixture::new();
         let source = fixture.0.join("source.wav");
         ffmpeg(&[
@@ -2851,33 +2948,44 @@ mod tests {
         request.split_normalization = SplitNormalization::After;
         request.fade_in_duration = 0.3;
         request.fade_out_duration = 0.4;
-        let window = Segment {
-            start_seconds: 0.5,
-            end_seconds: 5.0,
-        };
         let segment = Segment {
             start_seconds: 1.25,
             end_seconds: 4.25,
         };
         let (pid, cancelled) = control();
+        let mut progress = Vec::new();
         let comparison = render_comparison_files(
             Path::new("ffmpeg"),
             request.clone(),
-            &window,
             &segment,
             &fixture.0,
             &pid,
             &cancelled,
+            |update| {
+                progress.push(update.percent);
+                if let Some(path) = update.original_path {
+                    assert_eq!(update.percent, 50);
+                    assert!(Path::new(&path).metadata().unwrap().len() > 44);
+                    assert!(!fixture.0.join("B.wav").exists());
+                }
+            },
         )
         .await
         .unwrap();
+        assert!(progress.iter().any(|percent| (1..50).contains(percent)));
+        assert!(progress.iter().any(|percent| (51..100).contains(percent)));
+        assert!(progress.windows(2).all(|pair| pair[0] < pair[1]));
+        assert_eq!(progress.last(), Some(&100));
         let original = read_samples(Path::new(&comparison.original_path)).await;
         let processed = read_samples(Path::new(&comparison.processed_path)).await;
         assert_eq!(original.len(), 3 * 48_000);
         assert_eq!(processed.len(), original.len());
         assert!(sample_peak(&original[..480]) > 0.03);
         assert!(sample_peak(&processed[..480]) < 0.012);
-        assert!(sample_peak(&processed[48_000..96_000]) > 0.15);
+        assert_eq!(
+            sample_peak(&processed[48_000..96_000]),
+            sample_peak(&original[48_000..96_000])
+        );
         assert!(sample_peak(&processed[processed.len() - 480..]) < 0.012);
 
         let filter = segment_audio_filter(
@@ -2894,7 +3002,8 @@ mod tests {
         let args = segment_render_args(&request, &segment, &filter, &exported, None);
         let result = Command::new("ffmpeg").args(args).output().await.unwrap();
         assert!(result.status.success());
-        assert_eq!(processed, read_samples(&exported).await);
+        let exported = read_samples(&exported).await;
+        assert!(sample_peak(&exported[48_000..96_000]) > 0.15);
     }
     #[cfg(unix)]
     #[tokio::test]
